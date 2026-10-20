@@ -10,15 +10,15 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 )
 
 func TestSetupInputsDispatchIsReadOnlyAndReturnsOwnerManifest(t *testing.T) {
 	old := componentInputRoster
 	t.Cleanup(func() { componentInputRoster = old })
 	calls := 0
-	want := enginefiles.Manifest{Files: []enginefiles.File{{Path: "python/python.exe", Size: 3, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
-	componentInputRoster = func(ctx context.Context, python string, wheels []string, source string) (enginefiles.Manifest, error) {
+	want := programfiles.Manifest{Files: []programfiles.File{{Path: "python/python.exe", Size: 3, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+	componentInputRoster = func(ctx context.Context, python string, wheels []string, source string) (programfiles.Manifest, error) {
 		calls++
 		if python != "input-python" || !reflect.DeepEqual(wheels, []string{"input-wheels"}) || source != "input-source" {
 			t.Fatal("dispatch changed the explicit package input roots")
@@ -29,7 +29,7 @@ func TestSetupInputsDispatchIsReadOnlyAndReturnsOwnerManifest(t *testing.T) {
 	if code := runSetup([]string{"inputs", "--python-home", "input-python", "--wheels", "input-wheels", "--source", "input-source"}, &out, &failure); code != 0 {
 		t.Fatalf("inputs = %d: %s", code, failure.String())
 	}
-	var got enginefiles.Manifest
+	var got programfiles.Manifest
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil || !reflect.DeepEqual(got, want) || calls != 1 {
 		t.Fatalf("owner manifest = %v, calls %d, error %v", got, calls, err)
 	}
@@ -47,8 +47,8 @@ func TestSetupInputsDispatchIsReadOnlyAndReturnsOwnerManifest(t *testing.T) {
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Fatal("input dispatch created a component/state root")
 	}
-	componentInputRoster = func(context.Context, string, []string, string) (enginefiles.Manifest, error) {
-		return enginefiles.Manifest{}, errors.New("input pin changed")
+	componentInputRoster = func(context.Context, string, []string, string) (programfiles.Manifest, error) {
+		return programfiles.Manifest{}, errors.New("input pin changed")
 	}
 	out.Reset()
 	failure.Reset()

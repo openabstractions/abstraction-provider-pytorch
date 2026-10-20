@@ -10,16 +10,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/openabstractions/abstraction-facade/go/supervision"
 	"io"
 	"net/http"
 	"runtime"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	identity "github.com/openabstractions/abstraction-identity"
 	inference "github.com/openabstractions/abstraction-inference/go"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/devicelost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/devicelost"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
 	"github.com/openabstractions/abstraction-provider-kit/go/engineproc"
 	"github.com/openabstractions/abstraction-provider-kit/go/refusal"
 	"github.com/openabstractions/abstraction-provider-kit/go/videoops"
@@ -96,7 +97,10 @@ type Host struct {
 	resources *holder.Holder
 	video     *videoHost
 	torch     *torchShared
-	image     *torchImage
+	// images are the image sets the engine serves, by the model each is
+	// asked for, and imageRoute the one router host that lists them all.
+	images     *torchImages
+	imageRoute *router.Host
 	// watch is how often a running engine's sockets are checked again.
 	watch time.Duration
 	// afterFailedCheck, set by tests only, runs between a failed running
@@ -127,7 +131,7 @@ func New(options Options) (*Host, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	files := enginefiles.NewVerifier(enginefiles.Options{})
+	files := programfiles.NewVerifier(programfiles.Options{})
 	normalTorch := func(t TorchEngine) *TorchEngine {
 		if t.runtime.Release == "" {
 			//unchecked: a platform with no pin leaves the runtime zero, and every load is refused engine:none
@@ -199,6 +203,11 @@ func New(options Options) (*Host, error) {
 		Admit:  admit,
 		Leases: options.Leases, Resource: options.Resource, Idle: options.Idle,
 		Renew: options.Renew, Wait: options.Wait, Now: options.Now,
+		// Each lease is labelled with the model it holds for the person's
+		// Memory view (resource RES-L10). The runtime forwards the work, so
+		// the app that asked is not known here and the label is the model
+		// alone.
+		Label: func(name string) string { return name },
 		// A set's component is in use while its own work runs, and, when
 		// its lease is the process's own, while any set in that process
 		// works (PYTORCH-T10).
@@ -228,13 +237,32 @@ func New(options Options) (*Host, error) {
 		h.torch.active[h.video.opts.Model] = h.video.Active
 	}
 	if options.Image != nil {
-		if h.image, err = newTorchImage(h, h.torch, *options.Image); err != nil {
-			if h.video != nil {
-				h.video.Close()
+		// An image-only engine whose Beside is a second image set serves
+		// both sets as image@1, one process holding either or both
+		// (PYTORCH-T10).
+		served := []ImageOptions{*options.Image}
+		if t := options.Image.Torch; options.Video == nil && t.Beside != nil && t.Beside.Set.Profile == torchProfileImage {
+			second := *options.Image
+			second.Model = t.Beside.Set.Name
+			served = append(served, second)
+		}
+		h.images = &torchImages{}
+		var names []string
+		for _, opts := range served {
+			image, err := newTorchImage(h, h.torch, opts)
+			if err != nil {
+				if h.video != nil {
+					h.video.Close()
+				}
+				return nil, err
 			}
+			h.images.sets = append(h.images.sets, image)
+			h.torch.active[image.model] = image.active
+			names = append(names, image.model)
+		}
+		if h.imageRoute, err = router.NewImageEngine(imageRouteName, names); err != nil {
 			return nil, err
 		}
-		h.torch.active[h.image.model] = h.image.active
 	}
 	return h, nil
 }
@@ -243,14 +271,14 @@ func New(options Options) (*Host, error) {
 // inference provider's Config.ImageEngine and ImageEngineHost; both are nil
 // without one (PYTORCH-T11).
 func (h *Host) ImageEngine() (inference.ImageEngine, *router.Host) {
-	if h.image == nil {
+	if h.images == nil {
 		return nil, nil
 	}
-	return h.image, h.image.route
+	return h.images, h.imageRoute
 }
 
-// ServesImage reports whether name is the image set's model.
-func (h *Host) ServesImage(name string) bool { return h.image != nil && h.image.model == name }
+// ServesImage reports whether name is an image set's model.
+func (h *Host) ServesImage(name string) bool { return h.images.named(name) != nil }
 
 // VideoServer is this provider's video@1, for the service host's Video
 // field; nil when no video set is served.
@@ -443,4 +471,4 @@ var ErrEngineEnvironment = errors.New("pytorch: engine environment variable outs
 
 // registryString reads the profile registry for the clean environment's
 // builder; tests replace it.
-var registryString enginelaunch.RegistryValue = enginelaunch.SystemRegistry
+var registryString supervision.RegistryValue = supervision.SystemRegistry

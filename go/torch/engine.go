@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/openabstractions/abstraction-facade/go/supervision"
 	"io"
 	"net/http"
 	"os"
@@ -20,12 +21,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	"github.com/openabstractions/abstraction-identity/go/trustedpath"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/devicelost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/devicelost"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/modelbytes"
 	"github.com/openabstractions/abstraction-provider-kit/go/sandbox"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
+	storage "github.com/openabstractions/abstraction-storage/go"
 
 	identity "github.com/openabstractions/abstraction-identity"
 )
@@ -54,6 +57,7 @@ var torchKeyTables = []struct {
 	{"wan22-vae-keys", "wan-vae", "hummingbird-xt-i2v", torchWanVAEKeys},
 	{"umt5-xxl-keys", "umt5", "hummingbird-xt-i2v", torchUMT5Keys},
 	{"flux2-vae-keys", "flux-vae", "flux2-klein-4b", torchFluxVAEKeys},
+	{"flux2-vae-keys", "flux-vae", "flux2-klein-4b-compact", torchFluxVAEKeys},
 }
 
 // A TorchSetPlace is one model set an OA PyTorch engine serves: the set, a
@@ -72,11 +76,11 @@ type TorchSetPlace struct {
 // the GPU family the ROCm wheels were built for.
 type torchRuntime struct {
 	Release string
-	Python  enginefiles.File
+	Python  programfiles.File
 	// Base are the files of the base interpreter folder that run, by name
 	// in that folder: the interpreter, its DLLs and the C runtime it
 	// loads.
-	Base          []enginefiles.File
+	Base          []programfiles.File
 	PythonVersion string
 	// SitePackages is the venv's site-packages folder, a slash path below
 	// the venv; the engine adds it to its own path (PYTORCH-T1).
@@ -96,8 +100,8 @@ type torchRuntime struct {
 // owner's machine.
 var reviewedTorchRuntime = torchRuntime{
 	Release: "torch-2.11.0+rocm7.13.0 cpython-3.12.10 gfx1151",
-	Python:  enginefiles.File{Path: "python.exe", Size: 274424, SHA256: "0b471133e110cfb53a061cad528ce8e517d7b9ac41a0a396c39ad795a487fc14"},
-	Base: []enginefiles.File{
+	Python:  programfiles.File{Path: "python.exe", Size: 274424, SHA256: "0b471133e110cfb53a061cad528ce8e517d7b9ac41a0a396c39ad795a487fc14"},
+	Base: []programfiles.File{
 		{Path: "python.exe", Size: 104952, SHA256: "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a"},
 		{Path: "python312.dll", Size: 6945272, SHA256: "9a0e3435aaa680d868150f87ab3e388ad2eebc22f87e036155c7b4eda8cd2120"},
 		{Path: "python3.dll", Size: 70376, SHA256: "fb975a606e7fbf74f64260e3f60c3490b4f74a183c0926fd6ed1ac4c52ac7b1c"},
@@ -151,13 +155,23 @@ type TorchEngine struct {
 	// working folder live in.
 	State string
 	// Files proves and holds the engine's files and the model files.
-	Files *enginefiles.Verifier
+	Files *programfiles.Verifier
 	// Ready bounds a load; zero reads DefaultVideoReady.
 	Ready time.Duration
 	// Log is the absolute file the engine's stderr is kept in.
 	Log string
 	// MemoryLimit, when not zero, is the job's per-process memory limit.
 	MemoryLimit uint64
+	// Memory, when set, lends each model file to an engine in its sandbox
+	// as a sealed memory section OA filled from the held file and proved
+	// (provider kit INF-MS9, KIT-MB1..KIT-MB4), in place of the held file's
+	// handle. A fill that cannot be made lends the file's handle, with one
+	// log line.
+	Memory *ModelMemory
+	// Archive, when set with Memory, is the store a model file missing or
+	// refused where it was placed is filled from: the download archive
+	// (abstraction-download DL-R44), whose files the engine never reads.
+	Archive storage.Store
 	// Sandbox is the manifest of the engine's sandbox Setup installed
 	// (pytorchd setup install, PYTORCH-T12); every launch checks it and
 	// starts the engine inside it. Windows refuses a launch without one.
@@ -299,7 +313,7 @@ func torchOwners() trustedpath.Owners {
 // engineFile is one file of the engine group: its placed proof and the role
 // the load message names it by.
 type engineFile struct {
-	placed enginefiles.Placed
+	placed programfiles.Placed
 	role   string
 	module string
 	table  string
@@ -311,6 +325,7 @@ type engineFile struct {
 const (
 	roleLauncher = "launcher"
 	roleScript   = "script"
+	roleReceiver = "receiver"
 )
 
 // engineFiles are the venv's launcher, its pyvenv.cfg, the base interpreter
@@ -332,11 +347,11 @@ func (e TorchEngine) engineFiles() ([]engineFile, error) {
 	owners := torchOwners()
 	cfgSum := sha256.Sum256(data)
 	out := []engineFile{
-		{role: roleLauncher, placed: enginefiles.Placed{Path: e.Python, Size: e.runtime.Python.Size, SHA256: e.runtime.Python.SHA256, Owners: owners}},
-		{placed: enginefiles.Placed{Path: cfg, Size: int64(len(data)), SHA256: hex.EncodeToString(cfgSum[:]), Owners: owners}},
+		{role: roleLauncher, placed: programfiles.Placed{Path: e.Python, Size: e.runtime.Python.Size, SHA256: e.runtime.Python.SHA256, Owners: owners}},
+		{placed: programfiles.Placed{Path: cfg, Size: int64(len(data)), SHA256: hex.EncodeToString(cfgSum[:]), Owners: owners}},
 	}
 	for _, f := range e.runtime.Base {
-		out = append(out, engineFile{placed: enginefiles.Placed{Path: filepath.Join(home, filepath.FromSlash(f.Path)), Size: f.Size,
+		out = append(out, engineFile{placed: programfiles.Placed{Path: filepath.Join(home, filepath.FromSlash(f.Path)), Size: f.Size,
 			SHA256: f.SHA256, Owners: owners}})
 	}
 	script := e.script
@@ -347,7 +362,15 @@ func (e TorchEngine) engineFiles() ([]engineFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	out = append(out, engineFile{placed: enginefiles.Placed{Path: p, Size: int64(len(script)), SHA256: sum, Owners: owners}, role: roleScript})
+	out = append(out, engineFile{placed: programfiles.Placed{Path: p, Size: int64(len(script)), SHA256: sum, Owners: owners}, role: roleScript})
+	// The model bytes receiver (provider kit KIT-MB5) the script maps a
+	// lent model through.
+	rp, rsum, err := e.materialize("oa_model_bytes", modelbytes.PythonReceiver)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, engineFile{placed: programfiles.Placed{Path: rp, Size: int64(len(modelbytes.PythonReceiver)), SHA256: rsum, Owners: owners},
+		role: roleReceiver})
 	// The key tables and the source of every set the engine serves are held
 	// for the process's life, so a set that joins a running engine reads
 	// the files proved at its launch.
@@ -360,11 +383,11 @@ func (e TorchEngine) engineFiles() ([]engineFile, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, engineFile{placed: enginefiles.Placed{Path: p, Size: int64(len(t.data)), SHA256: sum, Owners: owners},
+			out = append(out, engineFile{placed: programfiles.Placed{Path: p, Size: int64(len(t.data)), SHA256: sum, Owners: owners},
 				table: t.table, set: sp.Set.Name})
 		}
 		for _, s := range sp.Set.Source {
-			out = append(out, engineFile{placed: enginefiles.Placed{Path: filepath.Join(e.Source, filepath.FromSlash(s.Path)),
+			out = append(out, engineFile{placed: programfiles.Placed{Path: filepath.Join(e.Source, filepath.FromSlash(s.Path)),
 				Size: s.Size, SHA256: s.SHA256, Owners: owners}, module: s.Module, set: sp.Set.Name})
 		}
 	}
@@ -448,7 +471,7 @@ func (e TorchEngine) materialize(name string, data []byte) (string, string, erro
 	sum := sha256.Sum256(data)
 	digest := hex.EncodeToString(sum[:])
 	ext := ".py"
-	if name != "oa_torch_engine" {
+	if name != "oa_torch_engine" && name != "oa_model_bytes" {
 		ext = ".json"
 	}
 	dir := filepath.Join(e.State, "engine")
@@ -483,20 +506,20 @@ func (e TorchEngine) engineRecord() string { return filepath.Join(e.State, "engi
 
 // modelPlaced is each pinned model file of sp where its places record says
 // it lies, with its owners.
-func modelPlaced(sp TorchSetPlace) ([]enginefiles.Placed, error) {
+func modelPlaced(sp TorchSetPlace) ([]programfiles.Placed, error) {
 	where, owners, err := readFilePlaces(sp.Places, sp.Set.Name, sp.Set.Files)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]enginefiles.Placed, 0, len(sp.Set.Files))
+	out := make([]programfiles.Placed, 0, len(sp.Set.Files))
 	for _, f := range sp.Set.Files {
-		out = append(out, enginefiles.Placed{Path: where[f.Name], Size: f.Size, SHA256: f.SHA256, Owners: owners[f.Name]})
+		out = append(out, programfiles.Placed{Path: where[f.Name], Size: f.Size, SHA256: f.SHA256, Owners: owners[f.Name]})
 	}
 	return out, nil
 }
 
-func placedOf(files []engineFile) []enginefiles.Placed {
-	out := make([]enginefiles.Placed, len(files))
+func placedOf(files []engineFile) []programfiles.Placed {
+	out := make([]programfiles.Placed, len(files))
 	for i, f := range files {
 		out[i] = f.placed
 	}
@@ -517,12 +540,18 @@ func (e TorchEngine) present(ctx context.Context, sp TorchSetPlace) error {
 	if err := e.Files.CheckPlaced(ctx, "the PyTorch engine", placedOf(files), e.engineRecord()); err != nil {
 		return fmt.Errorf("the PyTorch interpreter, engine or source files are not the reviewed ones (%w)", err)
 	}
-	models, err := modelPlaced(sp)
-	if err != nil {
+	if _, err := modelPlaced(sp); err != nil && !e.archiveServes() {
 		return err
 	}
-	if err := e.Files.CheckPlaced(ctx, sp.Set.Name, models, sp.ModelRecord); err != nil {
+	held, err := e.holdModels(ctx, sp, false)
+	if err != nil {
+		// A placed file that is not the pinned one marks the set not
+		// installed until models install or check proves it again.
+		markUnproven(sp.Places, err, e.report)
 		return fmt.Errorf("the %s files are not the pinned ones where they were placed (%w); place them again with pytorchd models install --set %s", sp.Set.Name, err, sp.Set.Name)
+	}
+	if err := held.Release(); err != nil {
+		return err
 	}
 	if _, err := e.gpuGate(); err != nil {
 		return err
@@ -555,7 +584,7 @@ func CheckTorchEngine(ctx context.Context, python, source, state, sandboxManifes
 	//unchecked: a platform with no pin leaves the runtime zero, which is refused by name below
 	rt, _ := pinnedTorchRuntime(runtime.GOOS, runtime.GOARCH)
 	e := TorchEngine{Python: python, Source: source, State: state, Set: set, runtime: rt, Sandbox: sandboxManifest,
-		Files: enginefiles.NewVerifier(enginefiles.Options{})}
+		Files: programfiles.NewVerifier(programfiles.Options{})}
 	switch {
 	case !filepath.IsAbs(python) || len(set.Source) > 0 && !filepath.IsAbs(source) || !filepath.IsAbs(state):
 		return errors.New("the interpreter, the source folder and the state folder must be absolute paths")
@@ -582,12 +611,41 @@ func CheckTorchEngine(ctx context.Context, python, source, state, sandboxManifes
 
 // CheckTorchModels proves a PyTorch set's files where places says they lie,
 // as a video does before its lease.
-func CheckTorchModels(ctx context.Context, files *enginefiles.Verifier, set TorchModelSet, places, record string) error {
+func CheckTorchModels(ctx context.Context, files *programfiles.Verifier, set TorchModelSet, places, record string) error {
 	placed, err := modelPlaced(TorchSetPlace{Set: set, Places: places})
 	if err != nil {
 		return err
 	}
-	return files.CheckPlaced(ctx, set.Name, placed, record)
+	if err := files.CheckPlaced(ctx, set.Name, placed, record); err != nil {
+		return err
+	}
+	// The files are proved again: the set is installed.
+	if err := os.Remove(unprovenMark(places)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// TorchModelsProven reports whether the provider holds a proof of set's
+// files under state: a places record that no load has since refused.
+func TorchModelsProven(state string, set TorchModelSet) bool {
+	places := TorchModelPlaces(state, set)
+	if _, err := os.Stat(places); err != nil {
+		return false
+	}
+	_, err := os.Lstat(unprovenMark(places))
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// unprovenMark is the file beside a set's places record that marks the set
+// not installed: a load found a placed file other than the pinned one.
+func unprovenMark(places string) string { return places + ".unproven" }
+
+// markUnproven records that a load refused the set's placed files.
+func markUnproven(places string, cause error, report func(error)) {
+	if err := os.WriteFile(unprovenMark(places), []byte(cause.Error()+"\n"), 0o600); err != nil && report != nil {
+		report(fmt.Errorf("marking %s not installed: %w", filepath.Base(places), err))
+	}
 }
 
 // torchSystemNames are the Windows variables the engine receives beside the
@@ -654,7 +712,7 @@ func (e TorchEngine) environment(gate []string) ([]string, []error, error) {
 	}
 	set = append(set, gate...)
 	var omitted []error
-	env, err := enginelaunch.CleanEnvironment{Temp: temp, Names: torchSystemNames, Registry: registryString, Set: set,
+	env, err := supervision.CleanEnvironment{Temp: temp, Names: torchSystemNames, Registry: registryString, Set: set,
 		OnError: func(err error) { omitted = append(omitted, err) }}.Build()
 	if err != nil {
 		return nil, nil, err
@@ -717,8 +775,11 @@ type torchProcess struct {
 
 	mu sync.Mutex
 	// holds are each set's held model files, by set name.
-	holds map[string]*enginefiles.Hold
-	ended bool
+	holds map[string]*heldModels
+	// pending are the model files each loading set's engine may still ask
+	// for, by set name and role (KIT-MB4).
+	pending map[string]map[string]pendingLend
+	ended   bool
 }
 
 // exited reports whether the process is gone.
@@ -732,7 +793,7 @@ func (t *torchProcess) exited() bool {
 }
 
 // keep records set's model hold; a process already gone releases it.
-func (t *torchProcess) keep(set string, hold *enginefiles.Hold) bool {
+func (t *torchProcess) keep(set string, hold *heldModels) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.ended {
@@ -759,7 +820,7 @@ func (t *torchProcess) releaseAll() error {
 	t.mu.Lock()
 	t.ended = true
 	holds := t.holds
-	t.holds = map[string]*enginefiles.Hold{}
+	t.holds = map[string]*heldModels{}
 	t.mu.Unlock()
 	var failures []error
 	for _, hold := range holds {
@@ -786,8 +847,7 @@ func (e TorchEngine) start(sp TorchSetPlace) (*torchProcess, error) {
 	if err != nil {
 		return nil, refuse(NoEngine, "%v", err)
 	}
-	models, err := modelPlaced(sp)
-	if err != nil {
+	if _, err := modelPlaced(sp); err != nil && !e.archiveServes() {
 		return nil, refuse(NoEngine, "%v", err)
 	}
 	// The path-length gate runs before every launch, as the GPU libraries
@@ -812,9 +872,9 @@ func (e TorchEngine) start(sp TorchSetPlace) (*torchProcess, error) {
 	}
 	engineHold, err := e.Files.LaunchPlaced(context.Background(), "the PyTorch engine", placedOf(files), e.engineRecord())
 	if err != nil {
-		return nil, refuse(NoEngine, "the PyTorch interpreter, engine or source files: %v", err)
+		return nil, refuse(NoEngine, "the Diffusers interpreter, engine or source files: %v", err)
 	}
-	modelHold, err := e.Files.LaunchPlaced(context.Background(), sp.Set.Name, models, sp.ModelRecord)
+	modelHold, err := e.holdModels(context.Background(), sp, true)
 	if err != nil {
 		//unchecked: the refusal below is the error returned; a failed close leaves only read-shared handles
 		engineHold.Release()
@@ -849,7 +909,7 @@ func (e TorchEngine) start(sp TorchSetPlace) (*torchProcess, error) {
 		launch.Close()
 		return err
 	}
-	t := &torchProcess{engine: e, files: files, finals: finals, fixes: fixes, site: site, holds: map[string]*enginefiles.Hold{},
+	t := &torchProcess{engine: e, files: files, finals: finals, fixes: fixes, site: site, holds: map[string]*heldModels{},
 		contained: launch != nil}
 	var container string
 	if launch != nil {
@@ -910,6 +970,7 @@ func (e TorchEngine) start(sp TorchSetPlace) (*torchProcess, error) {
 	}
 	conn := newTorchConn(outRead, inWrite, sp.Set.Name)
 	t.process, t.conn = p, conn
+	conn.onNeed(t.answerNeed)
 	// A holder observes p.exited. Publish that only after the file holds,
 	// sandbox lock and log have been released, so Close followed immediately
 	// by Setup/remove cannot race this cleanup goroutine.
@@ -940,7 +1001,7 @@ func (e TorchEngine) start(sp TorchSetPlace) (*torchProcess, error) {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		load, err := t.loadMessage(sp, modelHold.Paths())
+		load, err := t.loadMessage(sp, modelHold)
 		if err != nil {
 			return refuse(Unavailable, "the load message: %v", err)
 		}
@@ -978,11 +1039,10 @@ func (t *torchProcess) add(sp TorchSetPlace) (*torchSetState, error) {
 	if t.exited() {
 		return nil, errTorchEngineChanged
 	}
-	models, err := modelPlaced(sp)
-	if err != nil {
+	if _, err := modelPlaced(sp); err != nil && !t.engine.archiveServes() {
 		return nil, refuse(NoEngine, "%v", err)
 	}
-	hold, err := t.engine.Files.LaunchPlaced(context.Background(), sp.Set.Name, models, sp.ModelRecord)
+	hold, err := t.engine.holdModels(context.Background(), sp, true)
 	if err != nil {
 		return nil, refuse(NoEngine, "the %s files: %v", sp.Set.Name, err)
 	}
@@ -991,7 +1051,7 @@ func (t *torchProcess) add(sp TorchSetPlace) (*torchSetState, error) {
 		hold.Release()
 		return nil, errTorchEngineChanged
 	}
-	load, err := t.loadMessage(sp, hold.Paths())
+	load, err := t.loadMessage(sp, hold)
 	if err != nil {
 		t.release(sp.Set.Name)
 		return nil, refuse(Unavailable, "the load message: %v", err)
@@ -1029,8 +1089,8 @@ func finalOf(files []engineFile, finals []string, role string) string {
 // the engine adds to its path, the held final path of each file by role,
 // the set's source modules and key tables, the options, the dispatch row's
 // fixes and the preset.
-func (t *torchProcess) loadMessage(sp TorchSetPlace, modelFinals []string) (map[string]any, error) {
-	if len(t.finals) != len(t.files) || len(modelFinals) != len(sp.Set.Files) {
+func (t *torchProcess) loadMessage(sp TorchSetPlace, held *heldModels) (map[string]any, error) {
+	if len(t.finals) != len(t.files) || len(held.Paths()) != len(sp.Set.Files) {
 		return nil, errors.New("the held files do not match the proof")
 	}
 	source := map[string]any{}
@@ -1059,10 +1119,16 @@ func (t *torchProcess) loadMessage(sp TorchSetPlace, modelFinals []string) (map[
 	}
 	// The model files come last: in the sandbox each is a handle lent to
 	// the engine, which nothing after it may fail to send.
-	modelFiles, err := t.modelFiles(sp, modelFinals)
+	modelFiles, err := t.modelFiles(sp, held)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"op": "load", "set": sp.Set.Name, "site_packages": t.site, "files": modelFiles, "source": source,
-		"tables": tables, "options": options, "fixes": t.fixes, "preset": preset}, nil
+	load := map[string]any{"op": "load", "set": sp.Set.Name, "site_packages": t.site, "files": modelFiles, "source": source,
+		"tables": tables, "options": options, "fixes": t.fixes, "preset": preset}
+	for i, f := range t.files {
+		if f.role == roleReceiver {
+			load["receiver"] = map[string]any{"path": t.finals[i], "sha256": f.placed.SHA256}
+		}
+	}
+	return load, nil
 }

@@ -11,15 +11,19 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+
+	"github.com/openabstractions/abstraction-facade/go-core/childproc"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
 	"strings"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	identity "github.com/openabstractions/abstraction-identity"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
 	"github.com/openabstractions/abstraction-provider-kit/go/sandbox"
+	"github.com/openabstractions/abstraction-storage/go/layout"
 )
 
 // leanLock is the stack review's lean lock
@@ -43,20 +47,27 @@ type Component struct {
 	ExpectedRootKey string
 }
 
-// DefaultComponentRoot is %LOCALAPPDATA%\OpenAbstractions\engines\pytorch,
-// per user, no administrator.
+// DefaultComponentRoot is <account data>/OpenAbstractions/engines/pytorch
+// (%LOCALAPPDATA% on Windows, layout.AccountData), per user, no administrator.
 func DefaultComponentRoot() (string, error) {
-	local, err := os.UserCacheDir()
+	local, err := layout.AccountData()
 	if err != nil {
 		return "", fmt.Errorf("no local application data folder; pass --root: %w", err)
 	}
-	return filepath.Join(local, "OpenAbstractions", "engines", "pytorch"), nil
+	return filepath.Join(layout.EngineCacheRoot(local), "pytorch"), nil
 }
 
 func (c Component) Manifest() string  { return filepath.Join(c.Root, "sandbox.json") }
 func (c Component) EngineDir() string { return filepath.Join(c.Root, "engine") }
 func (c Component) BaseDir() string   { return filepath.Join(c.EngineDir(), "python") }
 func (c Component) Venv() string      { return filepath.Join(c.EngineDir(), "venv") }
+
+// SitePackages is the venv's site-packages holding the reviewed torch stack:
+// the folder a consumer's Python path configuration selects when it shares
+// this component. The adopter owns that configuration.
+func (c Component) SitePackages() string {
+	return filepath.Join(c.Venv(), filepath.FromSlash(reviewedTorchRuntime.SitePackages))
+}
 
 // Python is the venv's interpreter, the --python a component's engine runs.
 func (c Component) Python() string {
@@ -219,7 +230,7 @@ func InstallComponent(ctx context.Context, o ComponentInstall) error {
 		fmt.Fprintf(o.Out, format+"\n", a...)
 	}
 	say("the engine's sandbox: profile %s, phase installing", profile)
-	if err := o.installInterpreter(); err != nil {
+	if err := o.installInterpreter(ctx); err != nil {
 		return err
 	}
 	say("the base interpreter %s is the reviewed one", o.BaseDir())
@@ -268,9 +279,14 @@ var baseExcluded = []string{"Lib/test", "Lib/idlelib", "Lib/tkinter", "Lib/turtl
 
 // keepBase is the interpreter copy policy shared by installation and input
 // packaging. Package preparation never includes the person's site-packages.
+// It never includes a __pycache__ folder either: the interpreter writes one
+// whenever a standard module is first imported, so its contents follow the
+// person's use rather than python.org's release, and the engine runs with -B
+// and writes none.
 func keepBase(rel string, directory bool) bool {
 	if directory {
-		return (strings.Contains(rel, "/") || rel == "DLLs" || rel == "Lib") && !slices.Contains(baseExcluded, rel)
+		return (strings.Contains(rel, "/") || rel == "DLLs" || rel == "Lib") && !slices.Contains(baseExcluded, rel) &&
+			path.Base(rel) != "__pycache__"
 	}
 	return strings.Contains(rel, "/") || strings.HasSuffix(rel, ".exe") || strings.HasSuffix(rel, ".dll") || rel == "LICENSE.txt"
 }
@@ -280,14 +296,14 @@ func keepBase(rel string, directory bool) bool {
 // repository at the review's commit; its infer/ and licence files are kept.
 // It returns the existing enginefiles manifest and creates no component,
 // interpreter, venv, profile, grants or process.
-func ComponentInputs(ctx context.Context, pythonHome string, wheels []string, source string) (enginefiles.Manifest, error) {
+func ComponentInputs(ctx context.Context, pythonHome string, wheels []string, source string) (programfiles.Manifest, error) {
 	rt, ok := pinnedTorchRuntime(runtime.GOOS, runtime.GOARCH)
 	if !ok {
-		return enginefiles.Manifest{}, fmt.Errorf("no reviewed PyTorch stack is pinned for %s/%s", runtime.GOOS, runtime.GOARCH)
+		return programfiles.Manifest{}, fmt.Errorf("no reviewed PyTorch stack is pinned for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 	// These are LICENSE and NOTICES of the same reviewed Hummingbird commit
 	// whose eight infer modules HummingbirdXTI2VTorch.Source already pins.
-	notices := []enginefiles.File{
+	notices := []programfiles.File{
 		{Path: "LICENSE", Size: 11328, SHA256: "f827333cb365d1beac339a38099c416c0d74590a9c279172929e92e683a5c7a6"},
 		{Path: "NOTICES", Size: 30932, SHA256: "558edf09969b2c9162955699a3dd5836cc423bc62fde30d5a458abfef63cf587"},
 	}
@@ -297,8 +313,8 @@ func ComponentInputs(ctx context.Context, pythonHome string, wheels []string, so
 // inputFilePin measures the bytes which supply the manifest entry in one
 // read. A fixed owner pin is checked against those same bytes; wheel locks
 // bind the full bytes by SHA-256 and have no separate size pin (Size -1).
-func inputFilePin(file, name string, expected *enginefiles.File) (enginefiles.File, error) {
-	var pin enginefiles.File
+func inputFilePin(file, name string, expected *programfiles.File) (programfiles.File, error) {
+	var pin programfiles.File
 	entry, err := os.Lstat(file)
 	if err != nil || !entry.Mode().IsRegular() {
 		return pin, fmt.Errorf("input %s is not a regular file", name)
@@ -317,15 +333,15 @@ func inputFilePin(file, name string, expected *enginefiles.File) (enginefiles.Fi
 	if err != nil {
 		return pin, err
 	}
-	pin = enginefiles.File{Path: name, Size: size, SHA256: hex.EncodeToString(hash.Sum(nil))}
+	pin = programfiles.File{Path: name, Size: size, SHA256: hex.EncodeToString(hash.Sum(nil))}
 	if expected != nil && (pin.SHA256 != expected.SHA256 || expected.Size >= 0 && pin.Size != expected.Size) {
-		return enginefiles.File{}, fmt.Errorf("input %s changed from its reviewed pin", name)
+		return programfiles.File{}, fmt.Errorf("input %s changed from its reviewed pin", name)
 	}
 	return pin, nil
 }
 
-func componentInputs(ctx context.Context, pythonHome string, folders []string, source string, rt torchRuntime, lock []byte, sources []TorchSourceFile, notices []enginefiles.File) (enginefiles.Manifest, error) {
-	var manifest enginefiles.Manifest
+func componentInputs(ctx context.Context, pythonHome string, folders []string, source string, rt torchRuntime, lock []byte, sources []TorchSourceFile, notices []programfiles.File) (programfiles.Manifest, error) {
+	var manifest programfiles.Manifest
 	if err := ctx.Err(); err != nil {
 		return manifest, err
 	}
@@ -352,7 +368,7 @@ func componentInputs(ctx context.Context, pythonHome string, folders []string, s
 	if err != nil {
 		return manifest, err
 	}
-	add := func(file, name string, expected *enginefiles.File) error {
+	add := func(file, name string, expected *programfiles.File) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -384,8 +400,8 @@ func componentInputs(ctx context.Context, pythonHome string, folders []string, s
 			if entry.IsDir() {
 				err = base(file, name)
 			} else {
-				var expected *enginefiles.File
-				if index := slices.IndexFunc(rt.Base, func(pin enginefiles.File) bool { return pin.Path == name }); index >= 0 {
+				var expected *programfiles.File
+				if index := slices.IndexFunc(rt.Base, func(pin programfiles.File) bool { return pin.Path == name }); index >= 0 {
 					expected = &rt.Base[index]
 				}
 				err = add(file, "python/"+name, expected)
@@ -400,14 +416,14 @@ func componentInputs(ctx context.Context, pythonHome string, folders []string, s
 		return manifest, err
 	}
 	for _, file := range selected {
-		pin := enginefiles.File{Size: -1, SHA256: file.SHA256}
+		pin := programfiles.File{Size: -1, SHA256: file.SHA256}
 		if err := add(file.Path, "wheels/"+filepath.Base(file.Path), &pin); err != nil {
 			return manifest, err
 		}
 	}
 	for _, pin := range sources {
 		file := filepath.Join(source, "infer", filepath.FromSlash(pin.Path))
-		expected := enginefiles.File{Size: pin.Size, SHA256: pin.SHA256}
+		expected := programfiles.File{Size: pin.Size, SHA256: pin.SHA256}
 		if err := add(file, "source/infer/"+pin.Path, &expected); err != nil {
 			return manifest, err
 		}
@@ -426,7 +442,7 @@ func componentInputs(ctx context.Context, pythonHome string, folders []string, s
 // component's copy already proves against the pins: the interpreter and
 // its DLLs at the top, DLLs\ and Lib\ but baseExcluded. The copy is made
 // beside the folder and renamed into place once its pins prove.
-func (o ComponentInstall) installInterpreter() error {
+func (o ComponentInstall) installInterpreter(ctx context.Context) error {
 	if o.verifyBase(o.BaseDir()) == nil {
 		return nil
 	}
@@ -446,7 +462,7 @@ func (o ComponentInstall) installInterpreter() error {
 	if err := removeTree(o.BaseDir()); err != nil {
 		return err
 	}
-	return os.Rename(part, o.BaseDir())
+	return retryInterpreterRename(ctx, func() error { return os.Rename(part, o.BaseDir()) })
 }
 
 // verifyBase proves the pinned base interpreter files in dir by size and
@@ -460,7 +476,7 @@ func (o ComponentInstall) verifyBase(dir string) error {
 	return nil
 }
 
-func verifyFile(p string, pin enginefiles.File) error {
+func verifyFile(p string, pin programfiles.File) error {
 	info, err := os.Lstat(p)
 	if err != nil {
 		return err
@@ -468,7 +484,7 @@ func verifyFile(p string, pin enginefiles.File) error {
 	if !info.Mode().IsRegular() || info.Size() != pin.Size {
 		return fmt.Errorf("%s is not the pinned file", p)
 	}
-	sum, err := fileSHA256(p)
+	sum, err := fileHex(p)
 	if err != nil {
 		return err
 	}
@@ -613,9 +629,15 @@ func (o ComponentInstall) installLock(ctx context.Context, entries []lockEntry) 
 	}
 	if o.Compile {
 		// Compile failures are pip's to ignore too: a module that does not
-		// compile is compiled again in memory when it is imported.
+		// compile is compiled again in memory when it is imported. This
+		// interpreter runs outside the sandbox, so no wheel may reach it:
+		// it is the base interpreter, whose folder no wheel writes (a
+		// wheel's files stay in the venv, and none replaces the venv's
+		// launcher or pyvenv.cfg), and -S keeps the site module from
+		// executing the .pth files the wheels placed; compileall imports
+		// the standard library alone.
 		//unchecked: see above
-		run(ctx, o.Python(), "-I", "-m", "compileall", "-q", "-j", "0", site)
+		run(ctx, filepath.Join(o.BaseDir(), "python.exe"), "-I", "-S", "-m", "compileall", "-q", "-j", "0", site)
 	}
 	return true, os.WriteFile(marker, []byte(digest+"\n"), 0o600)
 }
@@ -623,7 +645,7 @@ func (o ComponentInstall) installLock(ctx context.Context, entries []lockEntry) 
 // run runs one Setup step's program with an environment of the system's
 // own folders alone.
 func run(ctx context.Context, program string, args ...string) error {
-	cmd := exec.CommandContext(ctx, program, args...)
+	cmd := childproc.Hidden(exec.CommandContext(ctx, program, args...))
 	root := os.Getenv("SystemRoot")
 	cmd.Env = []string{"SystemRoot=" + root, "PATH=" + filepath.Join(root, "System32")}
 	out, err := cmd.CombinedOutput()

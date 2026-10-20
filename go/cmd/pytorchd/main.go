@@ -21,20 +21,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openabstractions/abstraction-identity/listen"
+	"github.com/openabstractions/abstraction-download/go/archive"
+	"github.com/openabstractions/abstraction-facade/go-core/bootstrap"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	inference "github.com/openabstractions/abstraction-inference/go"
-	"github.com/openabstractions/abstraction-inference/go/providerhost"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	logging "github.com/openabstractions/abstraction-logging/go"
 	"github.com/openabstractions/abstraction-provider-kit/go/engineproc"
+	"github.com/openabstractions/abstraction-provider-kit/go/modelfiles"
 	"github.com/openabstractions/abstraction-provider-kit/go/modelplace"
+	"github.com/openabstractions/abstraction-provider-kit/go/providerhost"
 	"github.com/openabstractions/abstraction-provider-kit/go/quarantine"
 	"github.com/openabstractions/abstraction-provider-kit/go/runtimeprog"
 	resource "github.com/openabstractions/abstraction-resource/go/client"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	"github.com/openabstractions/abstraction-resource/go/holder"
+	"github.com/openabstractions/abstraction-resource/go/instrument"
 
 	"github.com/openabstractions/abstraction-provider-pytorch/go/torch"
+	storage "github.com/openabstractions/abstraction-storage/go"
+	"github.com/openabstractions/abstraction-storage/go/layout"
 )
 
 const usage = `pytorchd runs the OA PyTorch engine: the provider's own Python script on
@@ -75,7 +79,7 @@ Usage:
   pytorchd setup remove [--root DIR] [--expected-root-key KEY]
   pytorchd serve --endpoint NAME [--python PATH] [--root DIR] [--source DIR]
                  [--video-model SET [--video-model-option NAME=VALUE]...]
-                 [--image-model SET] [--resource-endpoint PATH]
+                 [--image-model SET]... [--resource-endpoint PATH]
                  [--resource NAME] [--idle DURATION] [--wait DURATION]
                  [--ready DURATION] [--video-time-limit DURATION]
                  [--image-time-limit DURATION] [--memory-limit BYTES]
@@ -106,8 +110,9 @@ Commands:
                   provider's state and the model files stay
   serve           answer video@1 for --video-model and image@1 for
                   --image-model on the identity-bound local endpoint NAME, for
-                  the designated runtime program, until interrupted; with both
-                  the two sets share one engine process
+                  the designated runtime program, until interrupted; a video
+                  set and an image set, or two image sets, share one engine
+                  process
   engine check    prove the interpreter, the engine script and SET's source as
                   a load would; exit 0 when serve would start it
   models install  find each pinned file of SET in each --from folder, prove
@@ -122,6 +127,9 @@ Commands:
   help            print this help (also -h, --help, or no arguments)
 
 Options:
+  Endpoint shortcuts use [a-z0-9-]+. Absolute paths and full named pipes are
+  used verbatim. Other short spellings (dot, underscore, uppercase, spaces)
+  are no longer shortcuts; use the runtime-assigned explicit endpoint path.
   --endpoint NAME          local endpoint name
   --runtime-program P      absolute runtime executable permitted to call;
                            repeatable; default the installed runtime beside
@@ -142,7 +150,8 @@ Options:
   --video-model-option N=V one option of the video set; repeatable.
                            hummingbird-xt-i2v takes decode-dtype=f32 (the
                            default, AMD's) or bf16
-  --image-model SET        serve image@1 for SET (flux2-klein-4b)
+  --image-model SET        serve image@1 for SET (flux2-klein-4b, flux2-klein-4b-compact or
+                           z-image-turbo); given twice, one engine serves two image sets
   --resource-endpoint PATH abstraction.resource/leases@1's platform endpoint;
                            default $ABSTRACTION_RESOURCE_ENDPOINT, or the
                            installed runtime's
@@ -157,14 +166,17 @@ Options:
                            default the sets' measured commit with its margin on
                            Windows (43 GiB video, 25 GiB image, 55 GiB both)
   --state DIR              this provider's private state; default
-                           <user cache>\OpenAbstractions\providers\pytorch
+                           <account data>\OpenAbstractions\providers\pytorch
   --set SET                engine check and models: the reviewed PyTorch
                            model set; default hummingbird-xt-i2v
   --from DIR               models install: a folder that may hold the set's
                            files; repeatable, at least one
   --home DIR               models: read this directory as the user's home
   --models-root DIR        models: OA's model folder; default <home>\OA-models
-  --job-store DIR          models: the runtime's job store
+  --job-store DIR          models: the runtime's job store, whose results may
+                           share a file with a set folder; default
+                           %LOCALAPPDATA%\openabstractions\runtime-v1\jobs.
+                           An empty value is refused
   --dry-run                models protect: report and write nothing
 
 GPU faults: serve reads the Windows driver-reset and standby records and the
@@ -248,7 +260,8 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	sourceDir := fs.String("source", getenv("PYTORCH_SOURCE"), "")
 	videoModel := fs.String("video-model", "", "")
 	fs.Var(&videoOptions, "video-model-option", "")
-	imageModel := fs.String("image-model", "", "")
+	var imageModels repeated
+	fs.Var(&imageModels, "image-model", "")
 	resourceEndpoint := fs.String("resource-endpoint", getenv("ABSTRACTION_RESOURCE_ENDPOINT"), "")
 	resourceName := fs.String("resource", torch.DefaultResource, "")
 	idle := fs.Duration("idle", torch.DefaultIdle, "")
@@ -271,8 +284,21 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	if *endpoint == "" {
 		return fail(2, "--endpoint is required")
 	}
-	if *videoModel == "" && *imageModel == "" {
+	address, err := serveEndpoint(*endpoint)
+	if err != nil {
+		return fail(2, "%v", err)
+	}
+	if *videoModel == "" && len(imageModels) == 0 {
 		return fail(2, "at least one --video-model or --image-model is required")
+	}
+	// One engine process holds at most two sets: a video set and an image
+	// set, or two image sets (PYTORCH-T10).
+	if len(imageModels) > 2 || *videoModel != "" && len(imageModels) > 1 || len(imageModels) == 2 && imageModels[0] == imageModels[1] {
+		return fail(2, "--image-model names one image set, or two different ones without --video-model")
+	}
+	imageModel := new(string)
+	if len(imageModels) > 0 {
+		*imageModel = imageModels[0]
 	}
 	if fs.NArg() != 0 {
 		return fail(2, "unexpected arguments %q", fs.Args())
@@ -293,6 +319,14 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 			return fail(2, "no reviewed PyTorch image set is named %q", *imageModel)
 		}
 		imageSet = set
+	}
+	var besideSet torch.TorchModelSet
+	if len(imageModels) == 2 {
+		set, ok := torch.TorchModelSetNamed(imageModels[1])
+		if !ok || set.Profile != "image" {
+			return fail(2, "no reviewed PyTorch image set is named %q", imageModels[1])
+		}
+		besideSet = set
 	}
 	videoChoices, err := torch.ParseTorchOptions(videoSet, videoOptions)
 	if err != nil && *videoModel != "" {
@@ -321,8 +355,11 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		//unchecked: callback has no return path; a failed diagnostic cannot turn a failed load into success
 		fmt.Fprintf(stderr, "pytorchd: %v\n", err)
 	}
+	handler, closeDiagnostics := resolvedDiagnostics("pytorchd")
+	defer closeDiagnostics()
+	logger := slog.New(handler)
 	leases := resource.New(leaseEndpoint)
-	gpu, err := newGPUGuard(state, leases, stderr, report)
+	gpu, err := newGPUGuard(state, leases, stderr, report, logger)
 	if err != nil {
 		return fail(1, "%v", err)
 	}
@@ -335,6 +372,8 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	if err != nil {
 		return fail(1, "%v", err)
 	}
+	lentMemory := modelMemory(filepath.Join(state, "torch", "spans"), *resourceName, leases, logger)
+	modelArchive := downloadArchive(lentMemory, logger)
 	engine := func(set torch.TorchModelSet, options map[string]string, limit uint64) *torch.TorchEngine {
 		if memoryGiven {
 			limit = *memory
@@ -344,10 +383,11 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		return &torch.TorchEngine{Python: *python, Source: *sourceDir, Set: set, Options: options,
 			Places: torch.TorchModelPlaces(state, set), ModelRecord: torch.TorchModelRecord(state, set),
 			State: filepath.Join(state, "torch"), Ready: *ready, Log: filepath.Join(state, "logs", "torch.log"), MemoryLimit: limit,
-			Sandbox: sandboxManifest(component)}
+			Sandbox: sandboxManifest(component), Memory: lentMemory,
+			Archive: modelArchive}
 	}
 	options := torch.Options{Leases: leases, GPU: gpu, Resource: *resourceName, Idle: *idle, Wait: *wait,
-		OnError: report, OnEngineExit: engineproc.Report(slog.New(logging.LegacyDefault("pytorchd")), stderr, "pytorchd")}
+		OnError: report, OnEngineExit: engineproc.Report(logger, stderr, "pytorchd")}
 	var imagePlace *torch.TorchSetPlace
 	if *imageModel != "" {
 		imagePlace = &torch.TorchSetPlace{Set: imageSet, Places: torch.TorchModelPlaces(state, imageSet),
@@ -366,8 +406,16 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		e.Beside = imagePlace
 		options.Video = &torch.VideoOptions{Model: *videoModel, Torch: e, Store: content.Store, TimeLimit: *videoTimeLimit}
 	} else {
-		e := engine(imageSet, nil, imageSet.Commit)
+		limit := imageSet.Commit
+		if besideSet.Name != "" {
+			limit = torch.TorchCommitTogether(imageSet, nil, besideSet)
+		}
+		e := engine(imageSet, nil, limit)
 		e.Source = ""
+		if besideSet.Name != "" {
+			e.Beside = &torch.TorchSetPlace{Set: besideSet, Places: torch.TorchModelPlaces(state, besideSet),
+				ModelRecord: torch.TorchModelRecord(state, besideSet)}
+		}
 		options.Image.Torch = e
 	}
 	h, err := torch.New(options)
@@ -380,8 +428,12 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	providerConfig := torch.ProviderConfig(h, report)
 	if options.Image != nil {
 		// image@1 results are the caller's: the provider publishes each
-		// through its own content writer (PYTORCH-T11).
-		providerConfig.PrepareContentWrite, err = content.OutputWriter(listen.Endpoint(*endpoint), torch.ImageOutputLimit)
+		// through its own content writer (PYTORCH-T11). Its copy of a picture
+		// is a delivery copy and goes after its retention (KIT-V5).
+		if err := content.RetainOutputs(filepath.Join(state, "content-outputs.json"), providerhost.MinimumOutputRetention, nil, report); err != nil {
+			return fail(1, "%v", err)
+		}
+		providerConfig.PrepareContentWrite, err = content.OutputWriter(address, torch.ImageOutputLimit)
 		if err != nil {
 			return fail(1, "%v", err)
 		}
@@ -391,7 +443,7 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		return fail(1, "%v", err)
 	}
 	defer provider.Close()
-	served, err := torch.Listen(listen.Endpoint(*endpoint), provider, programs...)
+	served, err := torch.Listen(address, provider, programs...)
 	if err != nil {
 		return fail(1, "%v", err)
 	}
@@ -409,17 +461,24 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 	defer stop()
 	done := make(chan struct{})
 	go func() { defer close(done); h.Run(ctx) }()
-	go gpu.Run(ctx)
-	defer gpu.Flush()
+	gpuDone := make(chan struct{})
+	go func() { defer close(gpuDone); gpu.Run(ctx) }()
+	waitOutputs := content.ServeOutputRetention(ctx, time.Hour, func(pass providerhost.OutputPass, err error) {
+		logger.Info("pytorchd: output retention", "removed", pass.Removed, "kept", pass.Kept, "reading", pass.Reading)
+		if err != nil {
+			report(fmt.Errorf("output retention: %w", err))
+		}
+	})
+	defer func() { stop(); waitOutputs(); <-gpuDone; gpu.Flush() }()
 	var sets []string
 	if *videoModel != "" {
 		sets = append(sets, *videoModel+" (video@1)")
 	}
-	if *imageModel != "" {
-		sets = append(sets, *imageModel+" (image@1)")
+	for _, name := range imageModels {
+		sets = append(sets, name+" (image@1)")
 	}
 	//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
-	fmt.Fprintf(stdout, "pytorchd serving %s on %s; the engine starts on demand\n", strings.Join(sets, ", "), listen.Endpoint(*endpoint))
+	fmt.Fprintf(stdout, "pytorchd serving %s on %s; the engine starts on demand\n", strings.Join(sets, ", "), address)
 	err = served.Serve(ctx)
 	stop()
 	h.Close()
@@ -436,9 +495,9 @@ func runServe(args []string, stdout, stderr io.Writer, getenv func(string) strin
 // newGPUGuard is serve's GPU fault handling: the resource kit's provider
 // composition (gpufault.ForProvider) with the wake lease through leases@1,
 // as every card provider takes it, and OA logging.
-func newGPUGuard(state string, leases holder.Leases, stderr io.Writer, report func(error)) (*gpufault.Guard, error) {
+func newGPUGuard(state string, leases holder.Leases, stderr io.Writer, report func(error), logger *slog.Logger) (*gpufault.Guard, error) {
 	return gpufault.ForProvider(gpufault.ProviderOptions{Name: "pytorchd", State: state,
-		Wake: gpufault.LeaseWake(leases, 0, report), Logger: slog.New(logging.LegacyDefault("pytorchd")),
+		Wake: gpufault.LeaseWake(leases, 0, report), Logger: logger,
 		Stderr: stderr, Report: report})
 }
 
@@ -655,7 +714,8 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	home := fs.String("home", "", "")
 	stateDir := fs.String("state", "", "")
 	modelsRoot := fs.String("models-root", "", "")
-	jobStore := fs.String("job-store", modelplace.DefaultJobStore(getenv), "")
+	var jobStore modelplace.JobStoreFlag
+	fs.Var(&jobStore, "job-store", "")
 	dryRun := fs.Bool("dry-run", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
@@ -679,13 +739,7 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	if root != "" && !filepath.IsAbs(root) {
 		return fail(2, "--models-root names an absolute folder")
 	}
-	var linkRoots []string
-	if *jobStore != "" {
-		if !filepath.IsAbs(*jobStore) {
-			return fail(2, "--job-store names an absolute folder")
-		}
-		linkRoots = append(linkRoots, filepath.Clean(*jobStore))
-	}
+	linkRoots := jobStore.OwnedRoots(getenv)
 	if args[0] == "protect" {
 		if root == "" {
 			return fail(2, "no models root; pass --models-root DIR or --home DIR")
@@ -745,7 +799,7 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 		if err != nil {
 			return fail(1, "%v", err)
 		}
-		if err := torch.CheckTorchModels(context.Background(), enginefiles.NewVerifier(enginefiles.Options{}), set, places, record); err != nil {
+		if err := torch.CheckTorchModels(context.Background(), programfiles.NewVerifier(programfiles.Options{}), set, places, record); err != nil {
 			return fail(1, "%v", err)
 		}
 		for _, f := range set.Files {
@@ -760,7 +814,7 @@ func runModels(args []string, stdout, stderr io.Writer, getenv func(string) stri
 		if len(from) > 0 {
 			return fail(2, "--from belongs to models install")
 		}
-		if err := torch.CheckTorchModels(context.Background(), enginefiles.NewVerifier(enginefiles.Options{}), set, places, record); err != nil {
+		if err := torch.CheckTorchModels(context.Background(), programfiles.NewVerifier(programfiles.Options{}), set, places, record); err != nil {
 			return fail(1, "%v", err)
 		}
 		//unchecked: CLI output; the process exit code, not a returned error, already reports the outcome
@@ -784,7 +838,7 @@ func userHome(getenv func(string) string) string {
 }
 
 // stateFolder is this provider's private state: dir when it is given, or
-// <user cache>/OpenAbstractions/providers/pytorch. It is made when absent.
+// <account data>/OpenAbstractions/providers/pytorch. It is made when absent.
 func stateFolder(dir string) (string, error) {
 	dir, err := statePath(dir)
 	if err != nil {
@@ -799,14 +853,87 @@ func stateFolder(dir string) (string, error) {
 // statePath is the state folder stateFolder names, without making it.
 func statePath(dir string) (string, error) {
 	if dir == "" {
-		cache, err := os.UserCacheDir()
+		providers, err := layout.DefaultProviderStateRoot()
 		if err != nil {
 			return "", fmt.Errorf("no state folder; pass --state: %w", err)
 		}
-		dir = filepath.Join(cache, "OpenAbstractions", "providers", "pytorch")
+		dir = filepath.Join(providers, "pytorch")
 	}
 	if !filepath.IsAbs(dir) {
 		return "", fmt.Errorf("--state %s is not an absolute path", dir)
 	}
 	return filepath.Clean(dir), nil
+}
+
+// serveEndpoint routes CLI input only; bootstrap owns account placement.
+func serveEndpoint(value string) (string, error) {
+	windowsDrive := len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
+	if filepath.IsAbs(value) || strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\\`) || windowsDrive {
+		return value, nil
+	}
+	address, err := bootstrap.Endpoint(value)
+	if err != nil {
+		return "", fmt.Errorf("resolve short endpoint (names use [a-z0-9-]+; use an explicit absolute endpoint path for other names): %w", err)
+	}
+	return address, nil
+}
+
+// modelMemory lends a sandboxed engine its model files as sealed memory
+// sections OA fills (provider kit INF-MS9, KIT-MB1), proved by the span
+// records under spans, on a machine whose card draws from system memory
+// (resource instrument AdapterUnified). There each section is counted in
+// the provider's card resource while it is held: a second lease of the
+// section's size from what is free, asking no holder to yield (RES-L6),
+// released with the section. A refused or failed count lends the file
+// instead. On a machine with a discrete card, or one whose answer is
+// unknown, sections are off and nil is returned. Each answer is one log
+// line (architect ruling 2026-11-12; a memory hold rule for provider hosts
+// waits for the owner).
+func modelMemory(spans, card string, leases *resource.Client, logger *slog.Logger) *torch.ModelMemory {
+	unified, err := instrument.AdapterUnified()
+	if err != nil || !unified {
+		logger.Info("model memory: sections are off; the engine receives each model file's handle",
+			"unified", unified, "error", err)
+		return nil
+	}
+	logger.Info("model memory: sections are counted in the card's lease on this unified-memory machine", "card", card)
+	records, err := modelfiles.OpenSpanRecords(spans)
+	if err != nil {
+		logger.Warn("model memory: span records unavailable; every fill hashes its object whole", "error", err)
+		records = nil
+	}
+	return &torch.ModelMemory{Records: records, Hold: func(n int64) (func(), error) {
+		got, err := leases.AcquireFree(card, n)
+		if err != nil {
+			return nil, err
+		}
+		if got.Outcome != resource.AcquireFreeOutcomeAcquired || got.Lease == nil {
+			return nil, fmt.Errorf("%d bytes of %s: %v", n, card, got.Outcome)
+		}
+		id := got.Lease.ID
+		return func() {
+			if _, err := leases.Release(id); err != nil {
+				logger.Warn("model memory: release of a section's lease", "lease", id, "error", err)
+			}
+		}, nil
+	}}
+}
+
+// downloadArchive is the person's download archive as the store a model
+// file missing or refused where it was placed is filled from (PYTORCH-T12,
+// abstraction-download DL-R44), when sections are lent at all; nil
+// otherwise. Its setting is the account's, as the Panel and the installed
+// runtime keep it (archive.StateFor). Where the archive folder lies stays
+// inside the archive package.
+func downloadArchive(memory *torch.ModelMemory, logger *slog.Logger) storage.Store {
+	if memory == nil {
+		return nil
+	}
+	dir, err := archive.StateFor("")
+	if err != nil {
+		logger.Info("model memory: no download archive is read", "error", err)
+		return nil
+	}
+	archive.UseState(dir)
+	return archive.Store{}
 }

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
@@ -20,6 +21,7 @@ import (
 
 	identity "github.com/openabstractions/abstraction-identity"
 	"github.com/openabstractions/abstraction-provider-kit/go/sandbox"
+	contentdigest "github.com/openabstractions/abstraction-storage/go/digest"
 )
 
 // A lockEntry is one distribution of a --require-hashes lock: its name and
@@ -97,7 +99,7 @@ func wheelsByDigest(folders []string) (map[string]string, error) {
 			if !d.Type().IsRegular() || filepath.Ext(p) != ".whl" {
 				return nil
 			}
-			sum, err := fileSHA256(p)
+			sum, err := fileHex(p)
 			if err != nil {
 				return err
 			}
@@ -111,17 +113,10 @@ func wheelsByDigest(folders []string) (map[string]string, error) {
 	return out, nil
 }
 
-func fileSHA256(p string) (string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+// fileHex returns the file's SHA-256 as the bare hex locks and pins hold.
+func fileHex(p string) (string, error) {
+	_, d, err := contentdigest.File(context.Background(), p, nil)
+	return strings.TrimPrefix(d, contentdigest.Prefix), err
 }
 
 // recordRow is one RECORD line: the wheel path, its SHA-256 and size.
@@ -225,6 +220,9 @@ func installWheel(whl, site, venv string) error {
 		if err := sandbox.CheckLocalPlacement(dest); err != nil {
 			return err
 		}
+		if owned := venvOwnedFile(dest, venv); owned != "" {
+			return fmt.Errorf("%s holds %s, which would replace the venv's %s", whl, name, owned)
+		}
 		if err := extract(f, dest, row, listed && row.digest != ""); err != nil {
 			return fmt.Errorf("%s: %s: %w", whl, name, err)
 		}
@@ -285,6 +283,27 @@ func readRecord(r *zip.ReadCloser, distInfo string) (map[string]recordRow, error
 
 // extract writes one wheel entry to dest, checking its bytes against row
 // when check is set; a file that fails the check is removed.
+// venvOwned are the venv's files the venv module made and the engine's
+// launch proves: its launchers and pyvenv.cfg, which names the interpreter
+// a launcher starts. A wheel that replaced one would run its own program as
+// the venv's interpreter.
+var venvOwned = []string{"pyvenv.cfg", "Scripts/python.exe", "Scripts/pythonw.exe", "bin/python", "bin/python3"}
+
+// venvOwnedFile is the venvOwned file dest names, by name or, where both
+// exist, by file identity (an 8.3 alias included); empty for none.
+func venvOwnedFile(dest, venv string) string {
+	for _, p := range venvOwned {
+		owned := filepath.Join(venv, filepath.FromSlash(p))
+		if identity.SamePathName(dest, owned) {
+			return p
+		}
+		if same, err := identity.SameFile(dest, owned); err == nil && same {
+			return p
+		}
+	}
+	return ""
+}
+
 func extract(f *zip.File, dest string, row recordRow, check bool) error {
 	src, err := f.Open()
 	if err != nil {

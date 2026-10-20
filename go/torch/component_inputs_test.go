@@ -10,10 +10,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 )
 
-func inputFile(t *testing.T, root, name, data string) enginefiles.File {
+func inputFile(t *testing.T, root, name, data string) programfiles.File {
 	t.Helper()
 	file := filepath.Join(root, filepath.FromSlash(name))
 	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
@@ -23,7 +23,7 @@ func inputFile(t *testing.T, root, name, data string) enginefiles.File {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256([]byte(data))
-	return enginefiles.File{Path: name, Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
+	return programfiles.File{Path: name, Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
 }
 
 func inputSnapshot(t *testing.T, root string) map[string]string {
@@ -40,7 +40,7 @@ func inputSnapshot(t *testing.T, root string) map[string]string {
 		if entry.IsDir() {
 			files[name] = "directory"
 		} else {
-			files[name], err = fileSHA256(p)
+			files[name], err = fileHex(p)
 		}
 		return err
 	})
@@ -61,16 +61,19 @@ func TestComponentInputManifestUsesInstallationSelectorsWithoutEffects(t *testin
 	inputFile(t, python, "Lib/site-packages/personal.py", "personal install")
 	inputFile(t, python, "Lib/test/private.py", "test suite")
 	inputFile(t, python, "Scripts/pip.exe", "personal tool")
+	// Byte caches follow the person's imports, not python.org's release.
+	inputFile(t, python, "Lib/__pycache__/os.cpython-312.pyc", "cache of a personal import")
+	inputFile(t, python, "Lib/json/__pycache__/decoder.cpython-312.pyc", "nested cache")
 	wheel := inputFile(t, wheels, "nested/fixture-1.0-py3-none-any.whl", "locked wheel fixture")
 	inputFile(t, wheels, "unselected-1.0-py3-none-any.whl", "unselected wheel")
 	code := inputFile(t, source, "infer/models/fixture.py", "reviewed source fixture")
 	notice := inputFile(t, source, "LICENSE", "reviewed source licence")
 	inputFile(t, source, "README.md", "unselected source")
-	rt := torchRuntime{PythonVersion: "fixture", Base: []enginefiles.File{base}}
+	rt := torchRuntime{PythonVersion: "fixture", Base: []programfiles.File{base}}
 	lock := []byte("fixture==1.0 --hash=sha256:" + wheel.SHA256 + "\n")
 	sources := []TorchSourceFile{{Path: "models/fixture.py", Size: code.Size, SHA256: code.SHA256}}
 	before := inputSnapshot(t, root)
-	manifest, err := componentInputs(context.Background(), python, []string{wheels}, source, rt, lock, sources, []enginefiles.File{notice})
+	manifest, err := componentInputs(context.Background(), python, []string{wheels}, source, rt, lock, sources, []programfiles.File{notice})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +114,11 @@ func TestComponentInputManifestUsesInstallationSelectorsWithoutEffects(t *testin
 	if _, err := os.Stat(filepath.Join(copy, "Lib", "site-packages")); !os.IsNotExist(err) {
 		t.Fatal("installation copy admitted personal site-packages")
 	}
+	for _, cache := range []string{filepath.Join(copy, "Lib", "__pycache__"), filepath.Join(copy, "Lib", "json", "__pycache__")} {
+		if _, err := os.Stat(cache); !os.IsNotExist(err) {
+			t.Fatalf("installation copy admitted the byte cache %s", cache)
+		}
+	}
 }
 
 func TestComponentInputRefusedPinsHaveNoEffects(t *testing.T) {
@@ -122,7 +130,7 @@ func TestComponentInputRefusedPinsHaveNoEffects(t *testing.T) {
 			wheel := inputFile(t, wheels, "fixture.whl", "wheel")
 			code := inputFile(t, source, "infer/fixture.py", "source")
 			notice := inputFile(t, source, "LICENSE", "licence")
-			rt := torchRuntime{Base: []enginefiles.File{base}}
+			rt := torchRuntime{Base: []programfiles.File{base}}
 			lock := []byte("fixture==1.0 --hash=sha256:" + wheel.SHA256 + "\n")
 			sources := []TorchSourceFile{{Path: "fixture.py", Size: code.Size, SHA256: code.SHA256}}
 			file := map[string]string{"python": filepath.Join(python, "python.exe"), "wheel": filepath.Join(wheels, "fixture.whl"), "source": filepath.Join(source, "infer", "fixture.py"), "notice": filepath.Join(source, "LICENSE")}[invalid]
@@ -130,7 +138,7 @@ func TestComponentInputRefusedPinsHaveNoEffects(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := inputSnapshot(t, root)
-			if _, err := componentInputs(context.Background(), python, []string{wheels}, source, rt, lock, sources, []enginefiles.File{notice}); err == nil {
+			if _, err := componentInputs(context.Background(), python, []string{wheels}, source, rt, lock, sources, []programfiles.File{notice}); err == nil {
 				t.Fatal("changed reviewed input was accepted")
 			}
 			if after := inputSnapshot(t, root); !reflect.DeepEqual(before, after) {

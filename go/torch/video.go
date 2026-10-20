@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	digestfmt "github.com/openabstractions/abstraction-storage/go/digest"
 	"image"
 	"image/png"
 	"os"
@@ -15,8 +16,8 @@ import (
 	"time"
 
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/videoenc"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/videoenc"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 )
 
@@ -287,7 +288,7 @@ func (k *torchKind) complete(op *videoOp, params sdcpp.VideoParams, frames [][]b
 		return
 	}
 	sum := sha256.Sum256(data)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
+	digest := digestfmt.Hex(sum[:])
 	if err := v.Keep(digest, data); err != nil {
 		v.Finish(op, wire.VideoStateFailed, "content:unavailable", nil)
 		return

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,14 +14,14 @@ import (
 
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/rgbpng"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/rgbpng"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
-	router "github.com/openabstractions/abstraction-router/go"
 )
 
 // ImageOptions add the image engine kind: the OA PyTorch engine serving
-// image@1 for one model set (PYTORCH-T10, T11).
+// image@1 for one model set, or for two when Torch's Beside is a second
+// image set (PYTORCH-T10, T11).
 type ImageOptions struct {
 	// Model is the name the router lists and callers ask for; empty reads
 	// the set's name, and any other name is refused.
@@ -65,7 +66,6 @@ type torchImage struct {
 	sp        TorchSetPlace
 	model     string
 	timeLimit time.Duration
-	route     *router.Host
 
 	mu      sync.Mutex
 	waiting int
@@ -76,16 +76,46 @@ type torchImage struct {
 func newTorchImage(h *Host, shared *torchShared, opts ImageOptions) (*torchImage, error) {
 	sp, ok := shared.engine.place(opts.Model)
 	if !ok || sp.Set.Profile != torchProfileImage {
-		return nil, fmt.Errorf("pytorch: the image model %q is no image set of the PyTorch engine", opts.Model)
+		return nil, fmt.Errorf("pytorch: the image model %q is no image set of Diffusers", opts.Model)
 	}
 	if opts.TimeLimit <= 0 {
 		opts.TimeLimit = DefaultImageTimeLimit
 	}
-	route, err := router.NewImageEngine(imageRouteName, []string{opts.Model})
-	if err != nil {
-		return nil, err
+	return &torchImage{host: h, shared: shared, sp: sp, model: opts.Model, timeLimit: opts.TimeLimit}, nil
+}
+
+// torchImages are the image sets one engine serves, as one image engine:
+// each request goes to the set its model names. It is a pointer the
+// inference provider compares as its engine.
+type torchImages struct{ sets []*torchImage }
+
+// named is the image set asked for as model, or nil.
+func (ks *torchImages) named(model string) *torchImage {
+	if ks == nil {
+		return nil
 	}
-	return &torchImage{host: h, shared: shared, sp: sp, model: opts.Model, timeLimit: opts.TimeLimit, route: route}, nil
+	for _, k := range ks.sets {
+		if k.model == model {
+			return k
+		}
+	}
+	return nil
+}
+
+// Unsupported is the named set's refusal, or model: for a model none is.
+func (ks *torchImages) Unsupported(req wire.ImageRequest) string {
+	if k := ks.named(req.Model); k != nil {
+		return k.Unsupported(req)
+	}
+	return "model:" + req.Model
+}
+
+// Run makes one image on the set model names.
+func (ks *torchImages) Run(ctx context.Context, model string, req wire.ImageRequest, inputs map[string]inference.ImageInput, progress func(int64, string)) inference.ImageEngineReply {
+	if k := ks.named(model); k != nil {
+		return k.Run(ctx, model, req, inputs, progress)
+	}
+	return imageReply(wire.ReplyOutcomeUnsupportedFeature, "model:"+model)
 }
 
 // active reports a request waiting for or running on the engine.
@@ -93,6 +123,28 @@ func (k *torchImage) active() bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	return k.waiting > 0
+}
+
+// installed reports whether every file of the set lies where its places
+// record says, at its pinned size, by a stat of each: a set never placed, a
+// set whose file left and a set a load found other bytes for, until models
+// install or check proves it again, are not installed. The load still
+// proves every file.
+func (k *torchImage) installed() bool {
+	if _, err := os.Lstat(unprovenMark(k.sp.Places)); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	where, _, err := readFilePlaces(k.sp.Places, k.sp.Set.Name, k.sp.Set.Files)
+	if err != nil {
+		return false
+	}
+	for _, f := range k.sp.Set.Files {
+		info, err := os.Stat(where[f.Name])
+		if err != nil || !info.Mode().IsRegular() || info.Size() != f.Size {
+			return false
+		}
+	}
+	return true
 }
 
 // size is the request's size: the preset's for auto, else WIDTHxHEIGHT
@@ -116,11 +168,26 @@ func (k *torchImage) size(req wire.ImageRequest) (int, int, bool) {
 	return 0, 0, false
 }
 
+// sizeReason names the sizes the set measured, so a caller's next request
+// can name one: size:512x512, or size:512x512,768x768.
+func (k *torchImage) sizeReason() string {
+	sizes := make([]string, 0, len(k.sp.Set.Sizes))
+	for _, s := range k.sp.Set.Sizes {
+		sizes = append(sizes, fmt.Sprintf("%dx%d", s[0], s[1]))
+	}
+	return "size:" + strings.Join(sizes, ",")
+}
+
+var imagePromptLines = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ", "\u2028", " ", "\u2029", " ")
+
+// Keep the image prompt on one line without joining words across breaks.
+func imagePrompt(text string) string { return imagePromptLines.Replace(text) }
+
 // Unsupported refuses, before any check of rights or content and with no
 // engine effect, what the engine does not do: another model, an edit, more
 // than one image, a size the set did not measure, an extension, and a prompt
-// the sd path's bound refuses (no control character, U+2028 or U+2029
-// reaches an engine that may write it into its log).
+// outside the engine's byte and control-character bounds. Line breaks
+// become spaces before the prompt crosses the engine boundary.
 func (k *torchImage) Unsupported(req wire.ImageRequest) string {
 	switch {
 	case req.Model != k.model:
@@ -131,16 +198,13 @@ func (k *torchImage) Unsupported(req wire.ImageRequest) string {
 		return "count"
 	}
 	if _, _, ok := k.size(req); !ok {
-		return "size"
+		return k.sizeReason()
 	}
 	if len(req.RequiredExtensions) > 0 {
 		return "extension:" + req.RequiredExtensions[0]
 	}
-	if req.Prompt == "" {
+	if len(req.Prompt) > sdcpp.MaxPromptBytes || sdcpp.CheckPrompt(imagePrompt(req.Prompt)) != nil {
 		return "prompt"
-	}
-	if err := sdcpp.CheckPrompt(req.Prompt); err != nil {
-		return reasonOf(err)
 	}
 	return ""
 }
@@ -171,6 +235,12 @@ func (k *torchImage) Run(ctx context.Context, model string, req wire.ImageReques
 		}
 		return imageReply(wire.ReplyOutcomeUnsupportedFeature, reason)
 	}
+	// The router lists a set only while storage holds its files; a request
+	// that still reaches a set whose files are absent is refused before any
+	// GPU admission or lease (router ROUTE-E1).
+	if !k.installed() {
+		return imageReply(wire.ReplyOutcomeUnavailable, "engine:not_installed:"+imageRouteName)
+	}
 	emit := func(percent int64, message string) {
 		if progress != nil {
 			progress(percent, message)
@@ -196,7 +266,7 @@ func (k *torchImage) Run(ctx context.Context, model string, req wire.ImageReques
 			return imageReply(wire.ReplyOutcomeUnavailable, gpufault.WordQuarantined)
 		}
 		if word := admitImageGPU(ctx, gpu, fp, emit); word != "" {
-			if ctx.Err() != nil {
+			if errors.Is(ctx.Err(), context.Canceled) {
 				return imageReply(wire.ReplyOutcomeCancelled, "caller")
 			}
 			return imageReply(wire.ReplyOutcomeUnavailable, word)
@@ -227,13 +297,28 @@ func (k *torchImage) Run(ctx context.Context, model string, req wire.ImageReques
 		return imageReply(wire.ReplyOutcomeUnavailable, loadFailure(err))
 	}
 	defer release()
-	return k.generate(ctx, running, req.Prompt, width, height, fp, emit)
+	// Standby may have begun during the load: ask again before the first
+	// dispatch (RES-G5).
+	if gpu := k.host.options.GPU; gpu != nil {
+		if word := admitImageGPU(ctx, gpu, fp, emit); word != "" {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return imageReply(wire.ReplyOutcomeCancelled, "caller")
+			}
+			return imageReply(wire.ReplyOutcomeUnavailable, word)
+		}
+	}
+	return k.generate(ctx, running, imagePrompt(req.Prompt), width, height, fp, emit)
 }
 
 // admitImageGPU waits while the machine is in Modern Standby or the driver
 // is coming back from a reset, and returns the word that refuses the image
-// otherwise, or "" once it may run (RES-G3..RES-G5, PYTORCH-G1).
+// otherwise, or "" once it may run (RES-G3..RES-G5, PYTORCH-G1). The wait
+// lasts at most the request's own deadline, or gpuWaitBound when it has
+// none; at the bound the image is refused with the guard's word, gpu:standby
+// while the PC sleeps.
 func admitImageGPU(ctx context.Context, gpu *gpufault.Guard, fp gpufault.Fingerprint, emit func(int64, string)) string {
+	bound := time.NewTimer(gpuWaitBound)
+	defer bound.Stop()
 	for {
 		err := gpu.AdmitRequest(ctx, fp)
 		var refused *gpufault.Refusal
@@ -247,12 +332,19 @@ func admitImageGPU(ctx context.Context, gpu *gpufault.Guard, fp gpufault.Fingerp
 		timer := time.NewTimer(gpuWait)
 		select {
 		case <-timer.C:
+		case <-bound.C:
+			timer.Stop()
+			return refused.Word
 		case <-ctx.Done():
 			timer.Stop()
 			return refused.Word
 		}
 	}
 }
+
+// gpuWaitBound is the longest an image without its own deadline waits for
+// the GPU to come back from standby or a reset.
+var gpuWaitBound = 2 * time.Minute
 
 // imageSeed is a seed drawn for one image: image@1 names none.
 func imageSeed() (int64, error) {

@@ -39,6 +39,8 @@ class FakeRuntime(real.TorchRuntime):
         if not isinstance(fixes, list) or set(fixes) != real.KNOWN_FIXES:
             raise real.EngineFailure("config")
         real.add_site_packages(msg)
+        if "receiver" in msg:
+            real.load_receiver(msg["receiver"])
 
     def device_lost(self, exc):
         return real.device_lost_marker(exc)
@@ -59,6 +61,17 @@ class FakeSet:
 
     def load(self, msg, stage, runtime):
         path = list(sys.path)
+        if self.mode == "unpinned-file":
+            # The load names a SHA-256 for its first file other than the
+            # bytes the provider lends.
+            first = sorted(msg["files"])[0]
+            msg["files"][first] = dict(msg["files"][first], sha256="0" * 64)
+        # Every model file through the real receiver before torch is
+        # prepared, as the real sets read their tokenizer files: a lent
+        # handle in the sandbox, the held path outside it; its size and
+        # SHA-256 are the pin's.
+        for role, entry in sorted(msg["files"].items()):
+            real.entry_bytes(entry)
         runtime.prepare(msg, stage)
         # The text encode is wrapped as the real sets wrap theirs.
         self.encode = runtime.phased("text_encode", lambda: None)
@@ -68,11 +81,8 @@ class FakeSet:
                       "no_site": sys.flags.no_site})
         if msg.get("set") != self.name:
             raise real.EngineFailure("config")
-        # Every model file through the real receiver: a lent handle in the
-        # sandbox, the held path outside it; its size and SHA-256 are the
-        # pin's.
-        for role, entry in msg["files"].items():
-            real.entry_bytes(entry)
+        if "net-tcp" in ARGS:
+            record(event="network", **network_probe())
         for module, entry in msg["source"].items():
             if real.sha256_file(entry["path"]) != entry["sha256"]:
                 raise real.EngineFailure("source")
@@ -149,6 +159,136 @@ def native_fault():
     os._exit(9)
 
 
+def _address(text):
+    host, port = text.rsplit(":", 1)
+    return host, int(port)
+
+
+# A child interpreter, started without the engine's audit hook: Python's
+# own sockets to the test's loopback listener and receiver and, when the
+# test names one, to an address off the machine. Each sends its probe's
+# name, so the test's witness says which probe got out. It prints one JSON
+# object.
+NETWORK_CHILD = r"""
+import json, socket, sys
+tcp, udp = (a.rsplit(":", 1) for a in sys.argv[1:3])
+targets = [("loopback_tcp", tcp)]
+if len(sys.argv) > 3:
+    targets.append(("outside_tcp", sys.argv[3].rsplit(":", 1)))
+out = {}
+for label, (host, port) in targets:
+    try:
+        c = socket.create_connection((host, int(port)), timeout=3)
+        c.sendall(b"child-tcp")
+        c.close()
+        out[label] = "connected"
+    except OSError as e:
+        out[label] = "blocked: " + type(e).__name__
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.sendto(b"child-udp", (udp[0], int(udp[1])))
+    s.close()
+    out["loopback_udp"] = "sent"
+except OSError as e:
+    out["loopback_udp"] = "blocked: " + type(e).__name__
+print(json.dumps(out))
+"""
+
+
+def _native_tcp(host, port, timeout):
+    """A TCP connect through Winsock called directly, as torch's or ROCm's
+    native code would: no audit event, so no hook stands in its way. A
+    connection sends the probe's name."""
+    import ctypes
+    import threading
+
+    ws2 = ctypes.WinDLL("ws2_32", use_last_error=True)
+    ws2.WSAStartup.argtypes = [ctypes.c_ushort, ctypes.c_void_p]
+    ws2.socket.restype = ctypes.c_size_t
+    ws2.socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    ws2.connect.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    ws2.send.argtypes = [ctypes.c_size_t, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    ws2.closesocket.argtypes = [ctypes.c_size_t]
+
+    class SockaddrIn(ctypes.Structure):
+        _fields_ = [("family", ctypes.c_ushort), ("port", ctypes.c_ubyte * 2), ("addr", ctypes.c_ubyte * 4),
+                    ("zero", ctypes.c_ubyte * 8)]
+
+    data = ctypes.create_string_buffer(512)
+    if ws2.WSAStartup(0x0202, data) != 0:
+        return "no winsock"
+    s = ws2.socket(2, 1, 6)  # AF_INET, SOCK_STREAM, IPPROTO_TCP
+    if s == ctypes.c_size_t(-1).value:
+        return "blocked: socket %d" % ctypes.get_last_error()
+    sa = SockaddrIn(2, (ctypes.c_ubyte * 2)(port >> 8, port & 255), (ctypes.c_ubyte * 4)(*map(int, host.split("."))))
+    said = {}
+
+    def connect():
+        said["rc"] = ws2.connect(s, ctypes.byref(sa), ctypes.sizeof(sa))
+        said["error"] = ctypes.get_last_error()
+        if said["rc"] == 0:
+            ws2.send(s, b"native-tcp", 10, 0)
+
+    worker = threading.Thread(target=connect, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    ws2.closesocket(s)
+    worker.join(1)
+    if "rc" not in said:
+        return "blocked: timed out"
+    return "connected" if said["rc"] == 0 else "blocked: winsock %d" % said["error"]
+
+
+def network_probe():
+    """PYTORCH-T12: what the contained engine reaches. --net-tcp and
+    --net-udp name a loopback TCP listener and UDP receiver the test holds;
+    --net-outside, only when the test opts in, an address off the machine.
+    Python's sockets reach loopback past the audit hook, which allows
+    loopback, so only the sandbox stands between; Winsock called natively
+    passes no hook at all; and a child interpreter starts without the hook.
+    Each probe says connected, sent or blocked and sends its own name; the
+    test's listener and receiver are the authority on what arrived."""
+    import concurrent.futures
+    import socket
+    import subprocess
+
+    tcp, udp, outside = ARGS["net-tcp"], ARGS["net-udp"], ARGS.get("net-outside")
+
+    def python_tcp():
+        try:
+            c = socket.create_connection(_address(tcp), timeout=3)
+            c.sendall(b"python-tcp")
+            c.close()
+            return "connected"
+        except OSError as e:
+            return "blocked: " + type(e).__name__
+
+    def python_udp():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.sendto(b"python-udp", _address(udp))
+            s.close()
+            return "sent"
+        except OSError as e:
+            return "blocked: " + type(e).__name__
+
+    def child():
+        try:
+            argv = [sys.executable, "-I", "-S", "-B", "-c", NETWORK_CHILD, tcp, udp] + ([outside] if outside else [])
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            return json.loads(r.stdout) if r.returncode == 0 else {"failed": r.returncode, "stderr": r.stderr[-400:]}
+        except Exception as e:  # noqa: BLE001
+            return {"failed": type(e).__name__ + ": " + str(e)}
+
+    probes = {"python_loopback_tcp": python_tcp, "python_loopback_udp": python_udp,
+              "native_loopback_tcp": lambda: _native_tcp(*_address(tcp), 3), "child": child}
+    if outside:
+        probes["native_outside_tcp"] = lambda: _native_tcp(*_address(outside), 3)
+    with concurrent.futures.ThreadPoolExecutor(len(probes)) as pool:
+        futures = {k: pool.submit(f) for k, f in probes.items()}
+        return {k: f.result() for k, f in futures.items()}
+
+
 def real_stdout_fd():
     return real.GARBAGE_FD
 
@@ -170,5 +310,6 @@ if MODE == "garbage" or IMAGE_MODE == "garbage":
     real._claim_stdio = claim
 
 real.serve({"hummingbird-xt-i2v": FakeSet("hummingbird-xt-i2v", "video", MODE, ("transformer", "turbovaed")),
-            "flux2-klein-4b": FakeSet("flux2-klein-4b", "image", IMAGE_MODE, ("flux-transformer", "qwen3"))},
+            "flux2-klein-4b": FakeSet("flux2-klein-4b", "image", IMAGE_MODE, ("flux-transformer", "qwen3")),
+            "flux2-klein-4b-compact": FakeSet("flux2-klein-4b-compact", "image", IMAGE_MODE, ("flux-transformer", "qwen3"))},
            FakeRuntime())

@@ -18,11 +18,12 @@ provider on 2026-10-02 ([HISTORY.md](HISTORY.md)).
 
 **What's new here:** Hummingbird-XT video and FLUX.2 [klein] images run on
 an engine OA supplies, on Windows x64 with an AMD gfx1151 GPU, under a card
-lease and reached through the runtime. The engine loads only pinned files in
+[lease](https://openabstractions.github.io/reference.html#concept-resource.lease) and reached through the runtime. The engine loads only pinned files in
 place, its weights as safetensors. Its Python code makes no network call:
 the Hugging Face hub client and its HTTP stack are stubs that refuse every
-call, and the audit hook refuses the rest. The ROCm libraries that link
-`ws2_32` still need the OS-level block before the engine ships.
+call, and the audit hook refuses the rest. Native code, the ROCm libraries
+that link `ws2_32` included, and every child process are held by the
+engine's AppContainer, which has no network capability.
 
 Like every local engine, the provider is declared with `card:0`, loads each
 set under its own lease through the resource kit's `holder`, composes the
@@ -41,6 +42,14 @@ pytorchd models install --set flux2-klein-4b ^
 pytorchd serve --endpoint pytorch --video-model hummingbird-xt-i2v --image-model flux2-klein-4b ^
   --python <venv>\Scripts\python.exe --source <HummingbirdXT>\infer
 ```
+
+`--endpoint` short names use `[a-z0-9-]+` and resolve through the current
+account's bootstrap namespace. Absolute endpoint paths and full Windows named
+pipes are passed verbatim, including runtime-assigned provider paths. Dots,
+underscores, uppercase letters and spaces formerly passed through the CLI's
+unrestricted short-name interpolation; they now require an explicit path.
+This CLI shortcut restriction does not change registered provider-name grammar.
+
 
 `pytorchd help` prints every option. The provider writes the script into
 its state, proves the venv's interpreter, the script and AMD's eight source
@@ -89,7 +98,7 @@ model host, and the PyTorch sets move to this declaration. Until then
 provider `DIR\pytorch` inside it, so an isolated runtime keeps its own
 places, GPU quarantine and engine files apart from the person's default
 folder. Without `--state` the declaration names none and `pytorchd` uses
-`<user cache>\OpenAbstractions\providers\pytorch`. Record the sets in the
+`<account data>\OpenAbstractions\providers\pytorch`. Record the sets in the
 folder the declaration names: `pytorchd models install --state DIR\pytorch`
 for an isolated runtime. Places that `modelhostd models install --kind
 torch` recorded before the move are not migrated; run `pytorchd models

@@ -21,7 +21,7 @@ import (
 // one that fails ends the engine: its text never reaches a caller.
 
 const (
-	torchProtocol  = 2
+	torchProtocol  = 3
 	torchMaxHeader = 64 << 10
 	// torchMaxSetName bounds a model set's name in a message.
 	torchMaxSetName = 64
@@ -30,6 +30,15 @@ const (
 // torchCodes are the failure codes an engine's error and failed messages
 // may carry.
 var torchCodes = []string{"load", "files", "source", "config", "oom", "device", "input", "error"}
+
+// torchChecks are the checks a load error may name a model file failing:
+// the model bytes receiver absent or not the pin, no URI or an unreadable
+// one, no answer to the engine's need, a handle the receiver could not map,
+// bytes other than the pin's, no held path, and a tokenizer file name.
+var torchChecks = []string{"receiver", "uri", "need", "open", "pin", "path", "name"}
+
+// torchMaxFileName bounds a model file's name in a load error.
+const torchMaxFileName = 128
 
 // torchMessage is one message the engine sends. Fields outside a type's own
 // are refused.
@@ -51,6 +60,12 @@ type torchMessage struct {
 	Bytes   int64  `json:"bytes,omitempty"`
 	// Protocol is the hello's version.
 	Protocol int `json:"protocol,omitempty"`
+	// Role is the model file a need asks for.
+	Role string `json:"role,omitempty"`
+	// File and Check are the pinned model file a load error concerns and the
+	// check it failed.
+	File  string `json:"file,omitempty"`
+	Check string `json:"check,omitempty"`
 
 	// payload is the binary frame after the header.
 	payload []byte
@@ -61,7 +76,7 @@ var torchFields = map[string][]string{
 	"hello":     {"type", "protocol", "pid"},
 	"loading":   {"type", "set", "stage"},
 	"ready":     {"type", "set"},
-	"error":     {"type", "set", "code"},
+	"error":     {"type", "set", "code", "file", "check"},
 	"unloaded":  {"type", "set"},
 	"pong":      {"type", "seq", "healthy"},
 	"progress":  {"type", "id", "phase", "done", "total"},
@@ -69,6 +84,7 @@ var torchFields = map[string][]string{
 	"done":      {"type", "id", "frames", "peak"},
 	"failed":    {"type", "id", "code"},
 	"cancelled": {"type", "id"},
+	"need":      {"type", "set", "role"},
 }
 
 // errTorchProtocol wraps every message the provider refuses.
@@ -101,7 +117,7 @@ func readTorchMessage(r *bufio.Reader, frameBytes int64) (torchMessage, error) {
 		}
 	}
 	switch m.Type {
-	case "loading", "ready", "error", "unloaded":
+	case "loading", "ready", "error", "unloaded", "need":
 		if m.Set == "" || len(m.Set) > torchMaxSetName {
 			return torchMessage{}, fmt.Errorf("%w: a %s message names no model set", errTorchProtocol, m.Type)
 		}
@@ -110,6 +126,12 @@ func readTorchMessage(r *bufio.Reader, frameBytes int64) (torchMessage, error) {
 	case "error", "failed":
 		if !slices.Contains(torchCodes, m.Code) {
 			return torchMessage{}, fmt.Errorf("%w: code %q", errTorchProtocol, m.Code)
+		}
+		if m.Check != "" && !slices.Contains(torchChecks, m.Check) {
+			return torchMessage{}, fmt.Errorf("%w: check %q", errTorchProtocol, m.Check)
+		}
+		if len(m.File) > torchMaxFileName || (m.File != "" && m.Check == "") {
+			return torchMessage{}, fmt.Errorf("%w: an error names a file without its check", errTorchProtocol)
 		}
 	case "frame":
 		if frameBytes <= 0 || m.Bytes != frameBytes {
@@ -126,6 +148,10 @@ func readTorchMessage(r *bufio.Reader, frameBytes int64) (torchMessage, error) {
 	case "hello":
 		if m.Protocol != torchProtocol || m.PID <= 0 {
 			return torchMessage{}, fmt.Errorf("%w: hello speaks protocol %d", errTorchProtocol, m.Protocol)
+		}
+	case "need":
+		if m.Role == "" || len(m.Role) > 64 {
+			return torchMessage{}, fmt.Errorf("%w: a need names no model file", errTorchProtocol)
 		}
 	case "loading":
 		if len(m.Stage) > 64 {
@@ -211,6 +237,16 @@ type torchConn struct {
 	pid   int
 	first string
 	sets  map[string]*torchSetState
+	// need answers the engine's need of one model file, when the load lends
+	// files on demand (KIT-MB4).
+	need func(set, role string)
+}
+
+// onNeed sets the function that answers the engine's needs.
+func (c *torchConn) onNeed(answer func(set, role string)) {
+	c.mu.Lock()
+	c.need = answer
+	c.mu.Unlock()
 }
 
 // torchSetState is one model set's load in one engine: ready closes when it
@@ -223,6 +259,9 @@ type torchSetState struct {
 	stage    string
 	isReady  bool
 	gone     bool
+	// file and check are the model file the engine's load error named and
+	// the check it failed, when it named one.
+	file, check string
 }
 
 // torchSink receives one job's messages. frameBytes is the size of one of
@@ -271,6 +310,15 @@ func (c *torchConn) loaded(set string) bool {
 	return s != nil && s.isReady && !s.gone
 }
 
+// holds reports whether set is in the engine, loading or loaded, and not
+// unloaded since.
+func (c *torchConn) holds(set string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.sets[set]
+	return s != nil && !s.gone
+}
+
 // stageOf is the last loading stage set reported.
 func (c *torchConn) stageOf(set string) string {
 	c.mu.Lock()
@@ -279,6 +327,17 @@ func (c *torchConn) stageOf(set string) string {
 		return s.stage
 	}
 	return ""
+}
+
+// failedFile is the model file set's refused load named and the check it
+// failed, or "" for both.
+func (c *torchConn) failedFile(set string) (file, check string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s := c.sets[set]; s != nil {
+		return s.file, s.check
+	}
+	return "", ""
 }
 
 // read takes the engine's messages until its output ends or one breaks the
@@ -331,6 +390,16 @@ func (c *torchConn) loop(r *bufio.Reader) error {
 			if err := c.setMessage(m); err != nil {
 				return err
 			}
+		case "need":
+			c.mu.Lock()
+			answer, s := c.need, c.sets[m.Set]
+			c.mu.Unlock()
+			if answer == nil || s == nil || s.isReady || s.gone {
+				return fmt.Errorf("%w: a need of %s outside %s's load", errTorchProtocol, m.Role, m.Set)
+			}
+			// The fill takes seconds; the engine's other messages keep
+			// flowing meanwhile.
+			go answer(m.Set, m.Role)
 		case "pong":
 			c.mu.Lock()
 			ch, ok := c.pongs[m.Seq]
@@ -385,6 +454,7 @@ func (c *torchConn) setMessage(m torchMessage) error {
 		}
 		select {
 		case s.failed <- m.Code:
+			s.file, s.check = m.File, m.Check
 		default:
 			return fmt.Errorf("%w: a second load error", errTorchProtocol)
 		}

@@ -8,7 +8,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
 )
 
 // torchReview is the security review of the PyTorch-on-ROCm stack the OA
@@ -125,7 +125,7 @@ var amdUsePolicy = UsePolicy{Name: "AMD Responsible AI Use Policy", License: "Op
 func gibTenths(n int64) int64 { return n * (1 << 30) / 10 }
 
 // TorchModelSets are the reviewed PyTorch model sets, by name.
-var TorchModelSets = []TorchModelSet{HummingbirdXTI2VTorch, Flux2Klein4BTorch}
+var TorchModelSets = []TorchModelSet{HummingbirdXTI2VTorch, Flux2Klein4BTorch, Flux2Klein4BCompactTorch, ZImageTurboTorch}
 
 // TorchModelSetNamed is the set of TorchModelSets named name.
 func TorchModelSetNamed(name string) (TorchModelSet, bool) {
@@ -138,8 +138,8 @@ func TorchModelSetNamed(name string) (TorchModelSet, bool) {
 }
 
 // HummingbirdXTI2VTorch is AMD's Hummingbird-XT image to video with its own
-// TurboVAED decoder on PyTorch for ROCm, the model set MuseTree's Idea Clip
-// runs, as research/live-runs/2026-10-01-rocm.md ran it: the i2v transformer
+// TurboVAED decoder on PyTorch for ROCm, as measured in
+// research/live-runs/2026-10-01-rocm.md: the i2v transformer
 // and TurboVAED where ASUS's AI store keeps them, the Wan 2.2 VAE and umT5
 // encoder from Wan-AI's own Diffusers safetensors, and the umT5 tokenizer
 // from amd/HummingbirdXT, each by SHA-256 (research/security-reviews/
@@ -149,7 +149,7 @@ var HummingbirdXTI2VTorch = TorchModelSet{
 	Review:  torchReview,
 	Profile: torchProfileVideo,
 	// AMD's infer/run_i2v.sh at 929e90a2: timesteps 1000, 750 and 500 at
-	// shift 10, guidance 1, boundary 0.875; MuseTree's Idea Clip size.
+	// shift 10, guidance 1, boundary 0.875; the reviewed 512x512 preset.
 	Preset:     TorchPreset{Timesteps: []int{1000, 750, 500}, Shift: 10, Guidance: 1, Boundary: 0.875, FPS: 16, Width: 512, Height: 512},
 	Sizes:      [][2]int{{512, 512}},
 	MaxFrames:  81,
@@ -249,10 +249,10 @@ const (
 // fluxKlein names the files of black-forest-labs/FLUX.2-klein-4B at the
 // revision research/live-runs/2026-10-01-rocm.md fetched its tokenizer from.
 const (
-	fluxKleinSource   = "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
-	fluxKleinRevision = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
-	comfyKleinSource  = "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-4b"
-	comfyKleinRev     = "5f526678002e43af5551dadb73ce2e8c91b43afe"
+	fluxKleinSource             = "https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"
+	fluxKleinRevision           = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
+	fluxKleinSingleFileSource   = "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-4b"
+	fluxKleinSingleFileRevision = "5f526678002e43af5551dadb73ce2e8c91b43afe"
 )
 
 // fluxTokenizerFile is one file of FLUX.2 [klein]'s Qwen3 tokenizer folder,
@@ -264,8 +264,8 @@ func fluxTokenizerFile(name, role string, size int64, sha256, blob string) Video
 }
 
 // Flux2Klein4BTorch is Black Forest Labs' FLUX.2 [klein] 4B text to image on
-// PyTorch for ROCm, the start image of MuseTree's Idea Clip, as
-// research/live-runs/2026-10-02.md ran it: 512x512 in four steps with
+// PyTorch for ROCm, using the start-image preset measured in
+// research/live-runs/2026-10-02.md: 512x512 in four steps with
 // guidance 1 (the distilled model needs no classifier-free guidance). Its
 // weights are Comfy-Org's single files in OA's model folders, the
 // transformer and VAE under Black Forest Labs' own tensor names and the
@@ -293,7 +293,7 @@ var Flux2Klein4BTorch = TorchModelSet{
 	// Phase 1: 19.0 GB peak process commit, with about 30 percent above it.
 	Commit:    25 << 30,
 	StepShare: map[string]int{"": 85},
-	// Both sets in one process, as MuseTree's engine holds them: phase 1 of
+	// Both sets in one process: phase 1 of
 	// 2026-10-02 reserved 40.9 GiB with the BF16 decode (run E of
 	// 2026-10-01: 40.5) and 44.4 GiB with the F32 decode; the process
 	// committed 42.6 and 48.3 GB at those peaks.
@@ -302,16 +302,16 @@ var Flux2Klein4BTorch = TorchModelSet{
 	Files: []VideoModelFile{
 		{Name: "flux-2-klein-4b.safetensors", Role: torchRoleFluxTransformer, Size: 7751105712,
 			SHA256: "ec3d4e733a771f61c052fb4856c48b336c55eaf2c65487c2a1faeb9bbda7a343",
-			Source: comfyKleinSource, Revision: comfyKleinRev, License: "Apache-2.0",
+			Source: fluxKleinSingleFileSource, Revision: fluxKleinSingleFileRevision, License: "Apache-2.0",
 			Locators: []string{"flux2-klein/flux-2-klein-4b.safetensors", "diffusion_models/flux-2-klein-4b.safetensors",
 				"split_files/diffusion_models/flux-2-klein-4b.safetensors"}},
 		{Name: "flux2-vae.safetensors", Role: torchRoleFluxVAE, Size: 336211292,
 			SHA256: "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
-			Source: comfyKleinSource, Revision: comfyKleinRev, License: "Apache-2.0",
+			Source: fluxKleinSingleFileSource, Revision: fluxKleinSingleFileRevision, License: "Apache-2.0",
 			Locators: []string{"flux2-klein/flux2-vae.safetensors", "vae/flux2-vae.safetensors", "split_files/vae/flux2-vae.safetensors"}},
 		{Name: "qwen_3_4b.safetensors", Role: torchRoleQwen3, Size: 8044982048,
 			SHA256: "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
-			Source: comfyKleinSource, Revision: comfyKleinRev, License: "Apache-2.0",
+			Source: fluxKleinSingleFileSource, Revision: fluxKleinSingleFileRevision, License: "Apache-2.0",
 			Locators: []string{"zimage/qwen_3_4b.safetensors", "text_encoders/qwen_3_4b.safetensors",
 				"split_files/text_encoders/qwen_3_4b.safetensors"}},
 		// BFL's Qwen3 tokenizer folder; the seven files lie in one folder.
@@ -330,6 +330,101 @@ var Flux2Klein4BTorch = TorchModelSet{
 		fluxTokenizerFile("merges.txt", "qwen3-merges", 1671853,
 			"8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5", "31349551d90c7606f325fe0f11bbb8bd5fa0d7c7"),
 	},
+}
+
+// The compact FLUX.2 [klein] files: Black Forest Labs' own FP8 transformer
+// and Comfy-Org's mixed FP8/NVFP4 Qwen3 4B encoder published for FLUX.2.
+const (
+	fluxKleinFP8Source       = "https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8"
+	fluxKleinFP8Revision     = "5b4408e59397a4a37ccb46afe426d8ed86379441"
+	fluxKleinCompactSource   = "https://huggingface.co/Comfy-Org/flux2-klein"
+	fluxKleinCompactRevision = "5b3abca5c0dc1ecd4eaf3340868d09063fc1c965"
+)
+
+// Flux2Klein4BCompactTorch is FLUX.2 [klein] 4B from its compact files,
+// 8.26 GB against the BF16 set's 16.13 GB: the FP8 transformer and the
+// FP8/NVFP4 encoder the engine turns to BF16 at load, with the BF16 set's
+// VAE and tokenizer. It runs the BF16 set's pipeline and preset; its lease,
+// commit and figures beside Hummingbird-XT are the BF16 set's until a GPU
+// run measures its own (the weights it holds are the same BF16 shapes).
+var Flux2Klein4BCompactTorch = func() TorchModelSet {
+	s := Flux2Klein4BTorch
+	s.Name = "flux2-klein-4b-compact"
+	s.Beside = slices.Clone(Flux2Klein4BTorch.Beside)
+	s.Files = []VideoModelFile{
+		{Name: "flux-2-klein-4b-fp8.safetensors", Role: torchRoleFluxTransformer, Size: 4070624520,
+			SHA256: "97ed34fe0567e436200f2faee3939b88f2b5d99f8af2a4dc16532c4245c0ccb6",
+			Source: fluxKleinFP8Source, Revision: fluxKleinFP8Revision, License: "Apache-2.0",
+			Locators: []string{"flux2-klein/flux-2-klein-4b-fp8.safetensors", "diffusion_models/flux-2-klein-4b-fp8.safetensors",
+				"split_files/diffusion_models/flux-2-klein-4b-fp8.safetensors"}},
+		Flux2Klein4BTorch.Files[1],
+		{Name: "qwen_3_4b_fp4_flux2.safetensors", Role: torchRoleQwen3, Size: 3848213998,
+			SHA256: "3eab03a77adb0ee5304a4e677d5c10ac22f9049c1d7c894adca4f8bb39206ca8",
+			Source: fluxKleinCompactSource, Revision: fluxKleinCompactRevision, License: "Apache-2.0",
+			Locators: []string{"flux2-klein/qwen_3_4b_fp4_flux2.safetensors", "text_encoders/qwen_3_4b_fp4_flux2.safetensors",
+				"split_files/text_encoders/qwen_3_4b_fp4_flux2.safetensors"}},
+	}
+	s.Files = append(s.Files, Flux2Klein4BTorch.Files[3:]...)
+	return s
+}()
+
+// Roles of a Z-Image set's own files, as the engine script names them in
+// its load message; its text encoder and tokenizer are the FLUX.2 [klein]
+// roles, since both read the same Qwen3 4B files.
+const (
+	torchRoleZImageTransformer = "zimage-transformer"
+	torchRoleZImageVAE         = "zimage-vae"
+)
+
+// zImageSource is Comfy-Org's repackaging of Tongyi-MAI's Z-Image-Turbo,
+// the files Setup's Z-Image-Turbo choice stages.
+const (
+	zImageSource   = "https://huggingface.co/Comfy-Org/z_image_turbo"
+	zImageRevision = "6fc90a3b1b653e935a0d175e260736de25b84df5"
+)
+
+// ZImageTurboTorch is Tongyi-MAI's Z-Image-Turbo text to image on PyTorch
+// for ROCm, through Diffusers' ZImagePipeline: Comfy-Org's single files,
+// the transformer through Diffusers' own Z-Image key conversion, the FLUX.1
+// autoencoder through its LDM key conversion, and the Qwen3 4B encoder and
+// tokenizer FLUX.2 [klein] reads, byte for byte the same files. The turbo
+// model is distilled to nine steps without guidance (its model card).
+var ZImageTurboTorch = TorchModelSet{
+	Name:       "z-image-turbo",
+	Review:     torchReview,
+	Profile:    torchProfileImage,
+	Preset:     TorchPreset{Steps: 9, Guidance: 0, Width: 1024, Height: 1024},
+	Sizes:      [][2]int{{1024, 1024}, {768, 768}, {512, 512}},
+	FirstFrame: FirstFrameNone,
+	// 2026-11-10 on the Radeon 8060S: 20.8 GB reserved once loaded and a
+	// 31.7 GB (29.5 GiB) peak for one 1024x1024 image in 131 s, load
+	// included, under a 34 GiB job limit; the lease is that peak with about
+	// 5 percent above it, and the commit that limit with a margin.
+	Lease:     gibTenths(310),
+	Commit:    40 << 30,
+	StepShare: map[string]int{"": 85},
+	// Beside either FLUX.2 [klein] in one process: both sets' own figures
+	// together, until a run measures them side by side.
+	Beside: []TorchBeside{
+		{Set: "flux2-klein-4b", Lease: map[string]int64{"": gibTenths(310 + 185)}, Commit: (40 + 25) << 30},
+		{Set: "flux2-klein-4b-compact", Lease: map[string]int64{"": gibTenths(310 + 185)}, Commit: (40 + 25) << 30},
+	},
+	Files: append([]VideoModelFile{
+		{Name: "z_image_turbo_bf16.safetensors", Role: torchRoleZImageTransformer, Size: 12309866400,
+			SHA256: "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6",
+			Source: zImageSource, Revision: zImageRevision, License: "Apache-2.0",
+			Locators: []string{"zimage/z_image_turbo_bf16.safetensors", "diffusion_models/z_image_turbo_bf16.safetensors",
+				"split_files/diffusion_models/z_image_turbo_bf16.safetensors"}},
+		{Name: "ae.safetensors", Role: torchRoleZImageVAE, Size: 335304388,
+			SHA256: "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+			Source: zImageSource, Revision: zImageRevision, License: "Apache-2.0",
+			Locators: []string{"zimage/ae.safetensors", "vae/ae.safetensors", "split_files/vae/ae.safetensors"}},
+		{Name: "qwen_3_4b.safetensors", Role: torchRoleQwen3, Size: 8044982048,
+			SHA256: "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+			Source: zImageSource, Revision: zImageRevision, License: "Apache-2.0",
+			Locators: []string{"zimage/qwen_3_4b.safetensors", "text_encoders/qwen_3_4b.safetensors",
+				"split_files/text_encoders/qwen_3_4b.safetensors"}},
+	}, Flux2Klein4BTorch.Files[3:]...),
 }
 
 // beside is the measured lease and commit of s and other resident in one
@@ -460,11 +555,13 @@ func (s TorchModelSet) valid() error {
 		}
 	}
 	for _, b := range s.Beside {
-		if b.Set == "" || b.Set == s.Name || b.Option == "" || len(b.Lease) == 0 || b.Commit == 0 {
+		// Figures beside a set with no options name no option and hold one
+		// lease, keyed "".
+		if b.Set == "" || b.Set == s.Name || len(b.Lease) == 0 || b.Commit == 0 || b.Option == "" && len(b.Lease) != 1 {
 			return fmt.Errorf("the PyTorch model set's figures beside %q are incomplete", b.Set)
 		}
 		for value, lease := range b.Lease {
-			if value == "" || lease <= s.Lease {
+			if (value == "") != (b.Option == "") || lease <= s.Lease {
 				return fmt.Errorf("the PyTorch model set's lease beside %s is not above its own", b.Set)
 			}
 		}

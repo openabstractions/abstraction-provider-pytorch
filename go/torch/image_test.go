@@ -21,8 +21,8 @@ import (
 
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/videoenc"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/videoenc"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	router "github.com/openabstractions/abstraction-router/go"
@@ -223,25 +223,50 @@ func TestTorchImageRefusesWhatTheEngineDoesNotDo(t *testing.T) {
 	leases := newFakeLeases()
 	h := f.imageHost(t, leases, nil)
 	for want, change := range map[string]func(*wire.ImageRequest){
-		"model:other":           func(r *wire.ImageRequest) { r.Model = "other" },
-		"mode:edit":             func(r *wire.ImageRequest) { r.Mode = wire.ImageModeEdit },
-		"count":                 func(r *wire.ImageRequest) { r.Count = 2 },
-		"size":                  func(r *wire.ImageRequest) { r.Size = "1024x1024" },
-		"extension:modelhost/x": func(r *wire.ImageRequest) { r.RequiredExtensions = []string{"modelhost/x"} },
-		"prompt":                func(r *wire.ImageRequest) { r.Prompt = "" },
-		sdcpp.ReasonVideoBound:  func(r *wire.ImageRequest) { r.Prompt = "line\nbreak" },
+		"model:other": func(r *wire.ImageRequest) { r.Model = "other" },
+		"mode:edit":   func(r *wire.ImageRequest) { r.Mode = wire.ImageModeEdit },
+		"count":       func(r *wire.ImageRequest) { r.Count = 2 },
+		fmt.Sprintf("size:%dx%d", testImageSide, testImageSide): func(r *wire.ImageRequest) { r.Size = "1024x1024" },
+		"extension:modelhost/x":                                 func(r *wire.ImageRequest) { r.RequiredExtensions = []string{"modelhost/x"} },
+		"prompt":                                                func(r *wire.ImageRequest) { r.Prompt = "unsafe\tcontrol" },
 	} {
 		request := imageRequest("a lighthouse")
 		change(&request)
-		if got := h.image.Unsupported(request); got != want {
+		if got := h.images.Unsupported(request); got != want {
 			t.Fatalf("%s: %q", want, got)
 		}
 		if reply, _ := runImage(t, h, context.Background(), request); reply.outcome != wire.ReplyOutcomeUnsupportedFeature {
 			t.Fatalf("%s: ran %+v", want, reply)
 		}
 	}
+	for _, prompt := range []string{"", strings.Repeat("a", sdcpp.MaxPromptBytes+1), "\x00", "\xff"} {
+		if got := h.images.Unsupported(imageRequest(prompt)); got != "prompt" {
+			t.Fatalf("invalid image prompt admitted: %q", got)
+		}
+	}
+
 	if acquires, _, _ := leases.counts(); acquires != 0 || len(f.records(t)) != 0 {
 		t.Fatalf("an engine started for a refused request: %d", acquires)
+	}
+}
+
+func TestTorchImageAcceptsMultilinePromptAtEngineBoundary(t *testing.T) {
+	engineRuns(t)
+	f := newTorchFixture(t)
+	h := f.imageHost(t, newFakeLeases(), nil)
+	const prompt = "red\r\nlighthouse\u2028over\u2029water"
+	request := imageRequest(prompt)
+	reply, _ := runImage(t, h, context.Background(), request)
+	if reply.outcome != wire.ReplyOutcomeCompleted {
+		t.Fatalf("multiline image was refused: %+v", reply)
+	}
+	const normalized = "red lighthouse over water"
+	if got := imagePrompt(prompt); got != normalized {
+		t.Fatalf("normalized prompt %q", got)
+	}
+	records := f.records(t)
+	if len(records) != 2 || records[1]["event"] != "generate" || records[1]["prompt_bytes"] != float64(len(normalized)) {
+		t.Fatalf("engine did not receive the normalized prompt: %v", records)
 	}
 }
 

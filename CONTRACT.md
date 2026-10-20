@@ -18,9 +18,11 @@ Binds: none (records only)
 | Service | Models | Rules |
 | --- | --- | --- |
 | `video@1` | `hummingbird-xt-i2v` | T1..T10 |
-| `image@1` | `flux2-klein-4b`, FLUX.2 [klein] 4B | T1..T5, T8, T10, T11 |
+| `image@1` | `flux2-klein-4b`, FLUX.2 [klein] 4B; `flux2-klein-4b-compact`, the same from its FP8/NVFP4 files | T1..T5, T8, T10, T11 |
 
 ## Reading this page
+
+The conventions every OA contract carries are stated once in [CONVENTIONS.md](https://github.com/openabstractions/abstractions/blob/main/idl/CONVENTIONS.md); a rule here that applies one cites its `CONV-` id.
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this
@@ -51,7 +53,7 @@ hold on `card:0` and on `awake` from that declaration, as for every card
 provider (facade FAC-R3), and routes callers to it through the router; no
 application reaches its endpoint.
 
-**[PYTORCH-D2] A load takes a lease first.** Every set loads through the
+**[PYTORCH-D2] A load takes a [lease](https://openabstractions.github.io/reference.html#concept-resource.lease) first.** Every set loads through the
 resource kit's `holder` under its own lease of `card:0` for its measured
 size (PYTORCH-T5), renewed while it is resident and released when it
 unloads, yields or the provider stops. A lease the service refuses is the
@@ -148,19 +150,37 @@ torch: the 169 transformer tensors by the conversion's own rules, the 250
 VAE tensors after rounding the F32 file to BF16 as the engine's cast does,
 and 396 of 398 encoder tensors by name; the other two, the last layer's
 MLP, feed no hidden state the pipeline reads, which takes layers 9, 18 and
-27).
+27). `flux2-klein-4b-compact` runs the same pipeline, VAE and tokenizer from
+Black Forest Labs' FP8 transformer (`flux-2-klein-4b-fp8.safetensors` at
+`5b4408e5`) and Comfy-Org's FP8/NVFP4 Qwen3 encoder
+(`qwen_3_4b_fp4_flux2.safetensors` at `5b3abca5`). The engine turns each
+scaled layer into a BF16 weight before the same strict loads: a
+float8_e4m3fn weight times its per-tensor `weight_scale` (an
+`input_scale` is dropped), and an NVFP4 weight, two E2M1 codes a byte with
+the first in the high nibble, times its float8_e4m3fn scale per 16 values in
+cuBLAS's tiled layout and its `weight_scale_2`; a scale without its weight
+or a format other than these two fails the load. Its lease and commit are
+the BF16 set's until measured.
 
 **[PYTORCH-T3] The engine is reached through its own stdin and stdout.**
 No port and no socket exists. Each message is one JSON header line of at
 most 64 KiB; a header with `bytes` N is followed by exactly N raw bytes.
-The provider sends `load`, `unload`, `generate`, `cancel` and `ping`; the
-engine answers `hello` (protocol 2), `loading`, `ready`, `error`,
-`unloaded`, `progress`, `frame`, `done`, `failed`, `cancelled` and `pong`,
-each with its own fields only. `load`, `unload` and `generate` name a model
+The provider sends `load`, `unload`, `generate`, `cancel`, `ping` and
+`lent`; the engine answers `hello` (protocol 3), `loading`, `ready`,
+`error`, `unloaded`, `progress`, `frame`, `done`, `failed`, `cancelled`,
+`pong` and `need`, each with its own fields only. `need` names the loading
+set and one model file's role; the provider answers `lent` with the file's
+URI, or without one, which fails the load (PYTORCH-T12). `load`, `unload` and `generate` name a model
 set, and `loading`, `ready`, `error` and `unloaded` name the set the
 provider asked to load; a frame is exactly the request's width × height × 3
 bytes, and a failure is one code of `load`, `files`, `source`, `config`,
-`oom`, `device`, `input` or `error`. The first message outside this list
+`oom`, `device`, `input` or `error`. An `error` over one model file may
+also carry `check`, one of `receiver`, `uri`, `need`, `open`, `pin`, `path`
+or `name`, and `file`, that file's pinned name. The provider's log line
+names the file, its role, the check, the stage and the engine log's path,
+and the caller reads `engine:files:<role>:<check>`. The engine loads the
+model bytes receiver before the set's own load, which reads its tokenizer
+files through it before torch is imported. The first message outside this list
 stops the engine. The engine points its
 own fd 0 at the null device and fd 1 at stderr, so no library writes into
 the protocol. stderr is the engine's log, `<state>/logs/torch.log`, at most
@@ -268,8 +288,10 @@ clips. An option or value the row does not offer exits 2.
 
 **[PYTORCH-T10] Two sets share one engine process.** With
 `--video-model` and `--image-model`, the video set and the image set
-are two holder components of one engine process, as MuseTree's engine
-holds FLUX.2 [klein] and Hummingbird-XT. Either set loads first and starts
+are two holder components of one engine process, as measured with FLUX.2
+[klein] and Hummingbird-XT (research/live-runs/2026-10-02.md phase 1).
+With `--image-model` given twice,
+two image sets are, as Setup serves FLUX.2 [klein] and `z-image-turbo`. Either set loads first and starts
 the process under its own lease, to which the process is bound; the other
 joins the running process with `load` and holds a second lease, bound to
 no process (one child binds to one lease, RES-L2), of the two sets'
@@ -279,7 +301,8 @@ with the F32 decode (research/live-runs/2026-10-02.md phase 1; run E of
 2026-10-01 reserved 40.5 GiB), so the image set joining the video set
 holds 9.9 or 13.4 GiB, and the video set joining the image set 23.4 or
 26.9 GiB. Two sets never measured together each hold
-their own lease. `resource/leases@1` grants an amount once and has no
+their own lease: `z-image-turbo` beside either FLUX.2 [klein] set holds
+31.0 GiB and the Klein set 18.5 GiB, 49.5 GiB together. `resource/leases@1` grants an amount once and has no
 resize (RES-L1, RES-L2), so the process's reservation grows by the joined
 set's lease and shrinks by giving it back; a swap to one larger lease would
 ask the service for the whole amount again while the first lease is still
@@ -287,9 +310,12 @@ held. Every engine operation holds the process's one operation slot: a
 load (the process's start or a set joining it), an unload and a job, so one
 runs at a time and an unload waits for a running job rather than queueing
 behind it in the engine. While an operation holds the slot every set's
-component is in use, and the first set's component is in use while either
-set has work queued or running, so neither the idle time nor a yield takes
-a set from under a job. The lock order is a set's holder component lock,
+component is in use, and the first set's component is in use while its own
+work or the work of a set the engine holds is queued or running, so neither
+the idle time nor a yield takes a set from under a job. Work queued for a
+set the engine does not hold leaves the first set idle: that set's load
+asks the idle first set to yield like any lease (resource RES-L9), which
+stops the process, and loads under its own lease. The lock order is a set's holder component lock,
 then the slot: a job holds its set's use and has the set loaded before it
 holds the slot, and a load or an unload takes the slot inside the component
 lock the holder holds through it. A driver reset takes no slot: the
@@ -308,26 +334,38 @@ check of that set, at the latest one renewal interval later. A set that
 fails to join is refused with the engine's code; the first set serves on,
 and the refused set's lease goes back. With both
 sets configured the process's memory limit is the two sets' commit
-together with its margin, 55 GiB (42.6 and 48.3 GB measured), unless
+together with its margin, 55 GiB (42.6 and 48.3 GB measured) for
+FLUX.2 [klein] beside Hummingbird-XT and the sum of their own commits,
+65 GiB, for `z-image-turbo` beside FLUX.2 [klein], unless
 `--memory-limit` names one.
 
 **[PYTORCH-T11] Images are served on the PyTorch engine.** `--image-model
-SET` serves `image@1` for one PyTorch image set, `flux2-klein-4b`, through
+SET` serves `image@1` for a PyTorch image set, `flux2-klein-4b`,
+`flux2-klein-4b-compact` or `z-image-turbo` (1024×1024, 768×768 or 512×512 in
+nine steps without guidance), each request on the set its model names, through
 the inference provider's composed image engine (inference
 `Config.ImageEngine` on the router host `pytorch-image`); the
 provider keeps admission, bounds and the caller's publication, and its
 Admit lets the image model through without a load. One request makes one
-image from its prompt alone at a size the set measured (512×512, size
-`auto`); an edit, a count above 1, another size and any extension are
-refused `unsupported_feature` before any rights check, and a prompt
-holding a control character, U+2028 or U+2029 with reason
-`video:engine-bound`, by the same bound as PYTORCH-T6. The image waits
+image from its prompt alone at a size the set offers, its preset size for
+size `auto` (FLUX.2 [klein] 512×512, `z-image-turbo` 1024×1024); an edit, a count above 1, another size and any extension are
+refused `unsupported_feature` before any rights check. The image engine
+maps CRLF, CR, LF, U+2028 and U+2029 to spaces at its execution boundary.
+It refuses an empty prompt, invalid UTF-8, other control characters or more
+than 2048 input bytes with reason `prompt`. Video retains PYTORCH-T6. A set is not
+installed while it was never placed, while a file is not where its places
+record names it at its pinned size, and after a load found a placed file
+other than the pinned one, until `pytorchd models install` or `models check`
+proves its files again. A request for a set that is not installed is
+refused `unavailable` with `engine:not_installed:pytorch-image` before any
+lease (router ROUTE-E1). The image waits
 while the machine is in Modern Standby or the driver comes back from a
 reset, and is refused `unavailable` with `gpu:quarantined` when its
 fingerprint is quarantined or `gpu:known-bad` at the dispatch row's
 known-bad token count (one token per 16×16 pixels and 512 text tokens);
-the wake lease is held while it runs. The engine receives the preset (four
-steps, guidance 1), the prompt, a seed the provider draws and the size;
+the wake lease is held while it runs. The engine receives the set's preset
+(FLUX.2 [klein] four steps with guidance 1, `z-image-turbo` nine steps
+with guidance 0), the prompt, a seed the provider draws and the size;
 progress arrives per step and for the decode once the device has finished
 each, the steps filling 85 of 100 and the decode the rest.
 A cancel reaches the engine, which stops before its next step and stays
@@ -354,8 +392,34 @@ stays held until Stop confirms exit and cleanup. The model files have no
 path grant. After a bounded hello,
 the actual Python receiver receives read-only handles only when its live
 process handle proves membership in the owned job and the exact container
-SID (FAC-P4, KIT-S6). The engine and every descendant have no network
-capabilities. Holder Stop completes only after post-exit model/engine holds,
+SID (FAC-P4, KIT-S6). On a machine whose card draws from system memory
+(Direct3D 12 reports the card:0 adapter UMA), `pytorchd serve` lends each
+model file as a sealed memory section: the load message marks the file
+`lend: memory`, the engine asks for it with `need` when its load reaches
+it, and the provider fills the section from the held file once the
+sections lent before it are freed (provider kit INF-MS9, KIT-MB4), proved
+by its span record after the first fill, and answers `lent` with a
+`kind=memory` model bytes URI and a lease (KIT-MB1). The engine maps it
+through `oa_model_bytes.py` (KIT-MB5), copies the tensors to the device
+through two 64 MiB pinned buffers, and releases it, which frees the
+section. Until the owner decides on a `memory` hold rule for provider
+hosts, each section is counted in the provider's card lease: a second
+lease of the section's size on the same card from what is free, asking no
+holder to yield (`AcquireFree`, RES-L6), released with the section; a
+refused count lends the file's handle instead. On a machine with a
+discrete card, or one whose answer is unknown, sections are off and the
+engine receives each file's handle, with one log line. Where sections are
+lent, a model file missing where it was placed, or not proving there, is
+filled from the person's download archive (abstraction-download DL-R44,
+`archive.Store`) when the archive finds its digest: local files first, then
+the archive, with one log line per file naming the archive as its source
+and no path. The fill reads the archive's file, proves the whole object
+against the pin before the section is lent, and writes no local copy; no
+engine reads the archive's file. Bytes that differ are refused before any
+engine maps them, the archive's own rule sets them aside, and the load
+fails until the file is placed or downloaded again. A file in neither place
+refuses as before. The engine and
+every descendant have no network capabilities. Holder Stop completes only after post-exit model/engine holds,
 the sandbox launch lock and the log have finished cleanup. A completed close
 error is reported through the provider's error callback and still lets the
 lease go; if cleanup exceeds its budget, Stop reports failure and the lease
@@ -403,9 +467,9 @@ such a trace without an exit record is no crash.
 | --- | --- | --- | --- |
 | `image@1` | the OA PyTorch engine (`--image-model`) | `flux2-klein-4b`, FLUX.2 [klein] 4B | T1..T5, T8, T10, T11 |
 | `video@1` `Start` | `unavailable` | `gpu:known-bad` | On the PyTorch engine, the clip's token count reaches the value the dispatch row records as hanging the GPU (PYTORCH-T8). |
-| `video@1` `Observe` | `failed` | `engine:none`, `engine:gpu-path`, `engine:unavailable`, `engine:network-socket`, `engine:sandbox`, `lease:*` | On the PyTorch engine: the interpreter, script, source or a placed file is not the pin, the venv is too deep for its GPU kernel paths, the sandbox is absent or changed, the engine failed its load or held a socket, or the lease was refused (PYTORCH-T1..T5, T12). |
-| `image@1` | `unsupported_feature` | `model:<name>`, `mode:edit`, `count`, `size`, `extension:<key>`, `prompt`, `video:engine-bound` | The PyTorch image set makes one image from a prompt at a measured size; the prompt is empty or beyond the sd path's bound (PYTORCH-T11). |
-| `image@1` | `unavailable` | `engine:none`, `engine:gpu-path`, `engine:unavailable`, `engine:network-socket`, `engine:sandbox`, `lease:*` | As for a PyTorch video, or the set failed to join the running engine (PYTORCH-T10..T12). |
+| `video@1` `Observe` | `failed` | `engine:none`, `engine:gpu-path`, `engine:unavailable`, `engine:files:<role>:<check>`, `engine:network-socket`, `engine:sandbox`, `lease:*` | On the PyTorch engine: the interpreter, script, source or a placed file is not the pin, the venv is too deep for its GPU kernel paths, the sandbox is absent or changed, the engine failed its load, over one model file and check (`engine:files:*`, PYTORCH-T3), or held a socket, or the lease was refused (PYTORCH-T1..T5, T12). |
+| `image@1` | `unsupported_feature` | `model:<name>`, `mode:edit`, `count`, `size:<WxH>[,<WxH>...]`, `extension:<key>`, `prompt` | The PyTorch image set makes one image from a prompt at a measured size, and a size refusal lists the measured sizes; the prompt is empty or beyond the sd path's bound (PYTORCH-T11). |
+| `image@1` | `unavailable` | `engine:none`, `engine:gpu-path`, `engine:unavailable`, `engine:files:<role>:<check>`, `engine:network-socket`, `engine:sandbox`, `lease:*` | As for a PyTorch video, or the set failed to join the running engine (PYTORCH-T10..T12). |
 | `image@1` | `unavailable` | `engine:refused`, `engine:failed`, `engine:result`, `engine:timeout`, `engine:lost` | The engine refused the request, failed, sent a result that differs from it, ran past `--image-time-limit`, or stopped answering (PYTORCH-T11). |
 | `image@1` | `unavailable` | `gpu:quarantined`, `gpu:known-bad`, `gpu:reset` | The image is paused after a reset it caused, its shape is recorded as hanging the GPU, or the engine was lost in a reset (PYTORCH-T11, G1). |
 

@@ -3,11 +3,13 @@ package torch
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 
 	identity "github.com/openabstractions/abstraction-identity"
+	"github.com/openabstractions/abstraction-provider-kit/go/modelbytes"
 	"github.com/openabstractions/abstraction-provider-kit/go/refusal"
 	"github.com/openabstractions/abstraction-provider-kit/go/sandbox"
 )
@@ -112,6 +114,30 @@ func (e TorchEngine) prepareSandbox(finals []string, site string) (*sandbox.Laun
 	return l, nil
 }
 
+// lendModel is the URI one model file reaches the engine by in the sandbox:
+// a sealed memory section OA filled from the held file and proved, with its
+// lease (KIT-MB1), when the engine has ModelMemory; otherwise, or when the
+// fill cannot be made, a read-only handle to the held file.
+func (t *torchProcess) lendModel(f VideoModelFile, final string) (string, error) {
+	if m := t.engine.Memory; m != nil {
+		uri, err := m.lend(t, f, final)
+		if err == nil {
+			return uri, nil
+		}
+		log.Printf("pytorch: %s is lent as its file: OA's memory section for it was not made: %v", f.Name, err)
+	}
+	return t.lendFile(f, final)
+}
+
+// lendFile is the URI of a read-only handle to the held file final.
+func (t *torchProcess) lendFile(f VideoModelFile, final string) (string, error) {
+	v, err := t.lend(final)
+	if err != nil {
+		return "", err
+	}
+	return modelbytes.URI{Handle: uint64(v), Length: uint64(f.Size), SHA256: f.SHA256}.String(), nil
+}
+
 // lend gives the running engine a read-only handle to the held file final
 // (KIT-S6): the provider opens it beside its own hold, which keeps the
 // bytes the proved ones, and the engine reads them through the handle.
@@ -128,19 +154,27 @@ func (t *torchProcess) lend(final string) (uintptr, error) {
 // pinned name, size and SHA-256, and, in the sandbox, an fd: URI naming a
 // read-only handle lent to the engine (VISION 2026-10-01, "model bytes");
 // outside it, the held file's final path.
-func (t *torchProcess) modelFiles(sp TorchSetPlace, finals []string) (map[string]any, error) {
+func (t *torchProcess) modelFiles(sp TorchSetPlace, held *heldModels) (map[string]any, error) {
+	finals := held.Paths()
 	if len(finals) != len(sp.Set.Files) {
 		return nil, errors.New("the held files do not match the proof")
 	}
 	out := map[string]any{}
 	for i, f := range sp.Set.Files {
 		entry := map[string]any{"name": f.Name, "size": f.Size, "sha256": f.SHA256}
-		if t.contained {
-			v, err := t.lend(finals[i])
+		if t.contained && t.engine.Memory != nil {
+			// Lent on demand: the engine asks when its load reaches the
+			// file, so one component's section is held at a time (KIT-MB4).
+			entry["lend"], entry["role"] = "memory", f.Role
+			t.await(sp.Set.Name, f, finals[i], held.refs[i])
+		} else if held.archived(i) {
+			return nil, fmt.Errorf("%s is in the archive, which reaches only a sandboxed engine through a section", f.Name)
+		} else if t.contained {
+			uri, err := t.lendModel(f, finals[i])
 			if err != nil {
 				return nil, fmt.Errorf("lend %s to the engine: %w", f.Name, err)
 			}
-			entry["uri"] = fmt.Sprintf("fd:%d?offset=0&length=%d&sha256=%s", v, f.Size, f.SHA256)
+			entry["uri"] = uri
 		} else {
 			entry["path"] = finals[i]
 		}

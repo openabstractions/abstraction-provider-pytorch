@@ -15,7 +15,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	"github.com/openabstractions/abstraction-provider-kit/go/sandbox"
 )
 
@@ -78,8 +78,26 @@ func buildWheel(dir, dist, version string, files map[string]string, extra map[st
 	if err := f.Close(); err != nil {
 		return "", "", err
 	}
-	sum, err := fileSHA256(p)
+	sum, err := fileHex(p)
 	return p, sum, err
+}
+
+// plantedRan is the file a planted interpreter writes beside itself.
+const plantedRan = "planted-ran"
+
+// plantedInterpreter reports whether this test binary runs under the name
+// python.exe, as a wheel that replaced the venv's launcher would run it
+// (TestWheelCannotReplaceTheVenvInterpreter); it then records that it ran,
+// beside itself, since the run passes it no variable.
+func plantedInterpreter() bool {
+	if !strings.EqualFold(filepath.Base(os.Args[0]), "python.exe") {
+		return false
+	}
+	if exe, err := os.Executable(); err == nil {
+		//unchecked: a missing record fails the test that looks for it
+		os.WriteFile(filepath.Join(filepath.Dir(exe), plantedRan), nil, 0o600)
+	}
+	return true
 }
 
 // lockFor is a lock naming each wheel by its SHA-256.
@@ -95,15 +113,15 @@ func lockFor(entries ...[3]string) []byte {
 // python.org's: the files that run and the venv launcher its venv module
 // copies.
 func pinsOf(home string) (torchRuntime, error) {
-	pin := func(p string) (enginefiles.File, error) {
+	pin := func(p string) (programfiles.File, error) {
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return enginefiles.File{}, err
+			return programfiles.File{}, err
 		}
 		sum := sha256.Sum256(data)
-		return enginefiles.File{Path: filepath.Base(p), Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}, nil
+		return programfiles.File{Path: filepath.Base(p), Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}, nil
 	}
-	var base []enginefiles.File
+	var base []programfiles.File
 	for _, pattern := range []string{"python.exe", "python3*.dll", "vcruntime140*.dll", "DLLs/_socket.pyd", "DLLs/select.pyd"} {
 		matches, _ := filepath.Glob(filepath.Join(home, filepath.FromSlash(pattern)))
 		for _, m := range matches {

@@ -31,15 +31,22 @@ func Admit(h *Host) inference.Admitter {
 func ProviderConfig(h *Host, report func(error)) inference.Config {
 	var images inference.ImageEngine
 	var imageHost *router.Host
+	routes := router.New()
 	if h != nil {
 		images, imageHost = h.ImageEngine()
+	}
+	if imageHost != nil {
+		// The provider routes each image request through its router, so the
+		// router holds the image set's host; an empty router answers every
+		// image request no_host "router:not-here".
+		routes = router.New(imageHost)
 	}
 	return inference.Config{
 		// The image set serves its router host in place of an HTTP
 		// adapter; its results need Config.PrepareContentWrite.
 		ImageEngine:     images,
 		ImageEngineHost: imageHost,
-		Router:          router.New(),
+		Router:          routes,
 		// The runtime bound the application and decided its rules before it
 		// forwarded; this endpoint admits that runtime's account alone.
 		Decide: func(context.Context, inference.Subject, string, string) (string, error) { return "permitted", nil },

@@ -10,15 +10,6 @@ import (
 	"testing"
 )
 
-const componentSecurityProbeOptIn = "OA_PYTORCH_SANDBOX_SECURITY_TESTS"
-
-func requireComponentSecurityProbeOptIn(t *testing.T) {
-	t.Helper()
-	if os.Getenv(componentSecurityProbeOptIn) != "1" {
-		t.Skipf("sandbox security probes are paused until the owner confirms Daybreak access is clear; set %s=1 only after that confirmation", componentSecurityProbeOptIn)
-	}
-}
-
 // PYTORCH-T1: the network-capable packages diffusers and transformers import
 // are stubs the engine's deny finder answers. In an interpreter with none of
 // them installed, each imports; the version, constants and decorators an
@@ -27,7 +18,6 @@ func requireComponentSecurityProbeOptIn(t *testing.T) {
 // check reads; a version-only distribution reports its version and has no
 // module; and every name read is recorded.
 func TestEngineAnswersNetworkPackagesWithStubs(t *testing.T) {
-	requireComponentSecurityProbeOptIn(t)
 	python, err := basePython()
 	if err != nil {
 		t.Skipf("no Python for the engine script: %v", err)

@@ -145,6 +145,7 @@ import threading  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
 import types  # noqa: E402
+import warnings  # noqa: E402
 
 
 # ---- network-capable packages: stubs, never their code -----------------
@@ -297,7 +298,9 @@ class _DenyFinder(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, _DenyFinder())
 
-PROTOCOL = 2
+PROTOCOL = 3
+# How long a load waits for the provider to fill and lend one model file.
+NEED_SECONDS = 900
 MAX_HEADER = 64 << 10
 MAX_PROMPT = 2048
 MAX_FRAME_BYTES = 4096 * 4096 * 3
@@ -333,15 +336,29 @@ class Cancelled(Exception):
 
 
 class EngineFailure(Exception):
-    """A failure the engine reports by code alone: no engine text reaches a caller."""
+    """A failure the engine reports by code, and for a model file by the
+    file's pinned name and the check it failed: no engine text reaches a
+    caller."""
 
-    def __init__(self, code):
-        super().__init__(code)
+    def __init__(self, code, file=None, check=None):
+        super().__init__(code if check is None else f"{code}: {file or 'a model file'} failed {check}")
         self.code = code
+        self.file = file if isinstance(file, str) else None
+        self.check = check
 
 
 # Codes a failed or error frame carries; the provider refuses any other.
 CODES = {"load", "files", "source", "config", "oom", "device", "input", "error"}
+# Checks a model file's refusal names (an error frame's "check"); the
+# provider refuses any other.
+CHECKS = {"receiver", "uri", "need", "open", "pin", "path", "name"}
+
+
+def _file_failure(entry, check):
+    """EngineFailure("files") naming entry's pinned file and the check it
+    failed."""
+    name = entry.get("name") if isinstance(entry, dict) else None
+    return EngineFailure("files", name, check)
 
 
 # ---- stdio: the protocol owns fd 0 and fd 1 -----------------------------
@@ -502,6 +519,8 @@ class Session:
         self.current = None
         self.mu = threading.Lock()
         self.healthy = True
+        self.lent = queue.Queue()
+        self.loading = None
 
     def read(self):
         """Reader thread: ping and cancel are answered at once, even while a
@@ -522,6 +541,8 @@ class Session:
                         job.cancel.set()
                 elif op in ("load", "unload", "generate"):
                     self.work.put((header, payload))
+                elif op == "lent":
+                    self.lent.put(header)
                 else:
                     raise ProtocolError("unknown op")
         except EOFError:
@@ -544,6 +565,23 @@ class Session:
             traceback.print_exception(exc, file=sys.stderr)
         self.wire.send({"type": "failed", "id": job_id, "code": code})
 
+    def need(self, role):
+        """One model file's URI from the provider, asked when the load of
+        the set reaches it: the provider fills its section now and answers
+        lent; an answer without a URI fails the load."""
+        set_name = self.loading
+        if not isinstance(role, str) or set_name is None:
+            raise EngineFailure("files", None, "need")
+        self.wire.send({"type": "need", "set": set_name, "role": role})
+        try:
+            answer = self.lent.get(timeout=NEED_SECONDS)
+        except queue.Empty:
+            raise EngineFailure("files", None, "need") from None
+        uri = answer.get("uri")
+        if answer.get("set") != set_name or answer.get("role") != role or not isinstance(uri, str) or not uri:
+            raise EngineFailure("files", None, "need")
+        return uri
+
     def load(self, header, first):
         """Load one set. The first set's failure ends the engine; a later
         set's leaves the loaded ones serving, unless the device was lost."""
@@ -559,24 +597,36 @@ class Session:
             self.wire.send({"type": "loading", "set": name, "stage": name_of_stage})
 
         self.runtime.on_phase = None
+        self.loading = name
         try:
             if model is None:
                 raise EngineFailure("config")
+            # The receiver comes first: a set reads its lent tokenizer files
+            # before torch is imported.
+            if "receiver" in header:
+                load_receiver(header["receiver"])
             model.load(header, stage, self.runtime)
         except Exception as exc:
+            self.loading = None
             marker = self.runtime.device_lost(exc)
             if marker:
                 self.healthy = False
                 print(f"oa-torch-engine: device-lost: {marker}", file=sys.stderr, flush=True)
             code = exc.code if isinstance(exc, EngineFailure) else ("device" if marker else ("oom" if self.runtime.out_of_memory(exc) else "load"))
             traceback.print_exception(exc, file=sys.stderr)
-            self.wire.send({"type": "error", "set": name, "code": code})
+            error = {"type": "error", "set": name, "code": code}
+            if isinstance(exc, EngineFailure) and exc.check in CHECKS:
+                error["check"] = exc.check
+                if exc.file is not None and len(exc.file) <= 128:
+                    error["file"] = exc.file
+            self.wire.send(error)
             if first or marker:
                 os._exit(3 if marker else 1)
             if model is not None:
                 model.unload()
             self.runtime.release()
             return
+        self.loading = None
         self.loaded.add(name)
         self.wire.send({"type": "ready", "set": name})
 
@@ -627,6 +677,8 @@ class Session:
                 self.current = None
 
     def run(self):
+        global _NEED
+        _NEED = self.need
         self.wire.send({"type": "hello", "protocol": PROTOCOL, "pid": os.getpid()})
         threading.Thread(target=self.read, name="oa-protocol", daemon=True).start()
         header, _ = self.work.get()
@@ -780,39 +832,74 @@ def add_site_packages(msg):
         sys.path.append(site)
 
 
+# The model bytes receiver the provider stages beside this script (provider
+# kit oa_model_bytes.py, KIT-MB5), loaded once from its proved path.
+_RECEIVER = None
+# _NEED asks the provider for one model file's URI when the load reaches it
+# (a file the load message marks "lend": "memory"); Session sets it.
+_NEED = None
+
+
+def load_receiver(entry):
+    """Import the receiver the load message names, after checking its
+    SHA-256; a missing or changed receiver fails the load."""
+    global _RECEIVER
+    if _RECEIVER is not None:
+        return _RECEIVER
+    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not os.path.isabs(entry["path"]):
+        raise EngineFailure("files", "oa_model_bytes.py", "receiver")
+    with open(entry["path"], "rb") as f:
+        data = f.read()
+    if hashlib.sha256(data).hexdigest() != entry.get("sha256"):
+        raise EngineFailure("files", "oa_model_bytes.py", "receiver")
+    module = types.ModuleType("oa_model_bytes")
+    exec(compile(data, entry["path"], "exec"), module.__dict__)
+    _RECEIVER = module
+    return module
+
+
 class _Lent:
     """One model file the provider lends: an fd: URI (VISION 2026-10-01,
-    "model bytes") naming a read-only handle the provider duplicated into
-    this process, whose sandbox may not open the file by path
-    (PYTORCH-T12). Opened, it is a private copy-on-write mapping of the
-    whole file; the handle is closed once mapped, and the mapping when the
-    with block ends."""
+    "model bytes", KIT-MB1) naming a read-only handle the provider
+    duplicated into this process, whose sandbox may not open the file by
+    path (PYTORCH-T12): a sealed memory section OA filled and proved
+    (kind=memory, with a lease), or the held file's handle. The receiver
+    maps it read-only; the with block's end unmaps it, closes the handle and
+    ends the lease, so OA frees the section once the tensors are on the
+    device."""
 
     def __init__(self, entry):
         uri, size = entry.get("uri"), entry.get("size")
-        m = re.fullmatch(r"fd:(\d+)\?offset=0&length=(\d+)&sha256=([0-9a-f]{64})", uri if isinstance(uri, str) else "")
-        if m is None or not isinstance(size, int) or int(m.group(2)) != size or m.group(3) != entry.get("sha256"):
-            raise EngineFailure("files")
-        self.handle, self.size, self.view = int(m.group(1)), size, None
+        if _RECEIVER is None:
+            raise _file_failure(entry, "receiver")
+        if uri is None and entry.get("lend") == "memory" and _NEED is not None:
+            # OA fills this file's section only now, so one component's
+            # section is held at a time (KIT-MB4).
+            try:
+                uri = _NEED(entry.get("role"))
+            except EngineFailure as e:
+                raise _file_failure(entry, e.check or "need") from None
+        if not isinstance(uri, str) or not isinstance(size, int):
+            raise _file_failure(entry, "uri")
+        try:
+            u = _RECEIVER.parse(uri)
+        except _RECEIVER.ModelBytesError:
+            raise _file_failure(entry, "uri") from None
+        if u["offset"] != 0 or u["length"] != size or u["sha256"] != entry.get("sha256"):
+            raise _file_failure(entry, "pin")
+        self.entry, self.uri, self.mb = entry, uri, None
 
     def __enter__(self):
-        import mmap
-        if os.name == "nt":
-            import msvcrt
-            fd = msvcrt.open_osfhandle(self.handle, os.O_RDONLY)
-        else:
-            fd = self.handle
         try:
-            if os.fstat(fd).st_size != self.size or self.size == 0:
-                raise EngineFailure("files")
-            self.view = mmap.mmap(fd, self.size, access=mmap.ACCESS_COPY)
-        finally:
-            os.close(fd)
-        return self.view
+            self.mb = _RECEIVER.open(self.uri)
+        except _RECEIVER.ModelBytesError:
+            raise _file_failure(self.entry, "open") from None
+        return self.mb.view
 
     def __exit__(self, *exc):
-        if self.view is not None:
-            self.view.close()
+        if self.mb is not None:
+            self.mb.release()
+            self.mb = None
 
 
 def entry_bytes(entry):
@@ -820,17 +907,17 @@ def entry_bytes(entry):
     configuration's: through its lent handle, or from the path the provider
     holds it at outside a sandbox; a size or SHA-256 other than the pin's
     fails the load."""
-    if "uri" in entry:
+    if "uri" in entry or "lend" in entry:
         with _Lent(entry) as view:
             data = bytes(view)
     else:
         path = entry.get("path")
         if not isinstance(path, str) or not os.path.isabs(path):
-            raise EngineFailure("files")
+            raise _file_failure(entry, "path")
         with open(path, "rb") as f:
             data = f.read()
     if len(data) != entry.get("size") or hashlib.sha256(data).hexdigest() != entry.get("sha256"):
-        raise EngineFailure("files")
+        raise _file_failure(entry, "pin")
     return data
 
 
@@ -897,27 +984,81 @@ def model_bytes(entry, device):
     read-only handle, an fd: URI, and each tensor is read from the mapping
     and moved to device, a copy on the CPU, so nothing keeps the mapping
     once loaded; outside it, the path the provider holds the file at."""
-    if "uri" not in entry:
+    if "uri" not in entry and "lend" not in entry:
         from safetensors.torch import load_file
         path = entry.get("path")
         if not isinstance(path, str) or not os.path.isabs(path):
-            raise EngineFailure("files")
+            raise _file_failure(entry, "path")
         if os.path.getsize(path) != entry.get("size"):
-            raise EngineFailure("files")
+            raise _file_failure(entry, "pin")
         return load_file(path, device=device)
     import torch
     out = {}
-    with _Lent(entry) as view:
-        for name, dtype, shape, begin, end in safetensors_layout(view):
-            kind = getattr(torch, dtype)
-            if end == begin:
-                out[name] = torch.empty(shape, dtype=kind, device=device)
-                continue
-            item = SAFETENSORS_DTYPES_ITEM[dtype]
-            cpu = torch.frombuffer(view, dtype=kind, count=(end - begin) // item, offset=begin).reshape(shape)
-            out[name] = cpu.clone() if device == "cpu" else cpu.to(device)
-            del cpu
+    stage = None if device == "cpu" else _Stage(torch)
+    try:
+        with _Lent(entry) as view:
+            for name, dtype, shape, begin, end in safetensors_layout(view):
+                kind = getattr(torch, dtype)
+                if end == begin:
+                    out[name] = torch.empty(shape, dtype=kind, device=device)
+                    continue
+                item = SAFETENSORS_DTYPES_ITEM[dtype]
+                with warnings.catch_warnings():
+                    # The view is read-only by design; the tensor is copied
+                    # below and never written.
+                    warnings.simplefilter("ignore", UserWarning)
+                    cpu = torch.frombuffer(view, dtype=kind, count=(end - begin) // item, offset=begin).reshape(shape)
+                if stage is None:
+                    out[name] = cpu.clone()
+                else:
+                    out[name] = stage.to_device(cpu, device)
+                del cpu
+            if stage is not None:
+                # Every byte has left the mapping before it is released.
+                stage.finish()
+    finally:
+        if stage is not None:
+            stage.finish()
     return out
+
+
+class _Stage:
+    """Two pinned host buffers a lent mapping's bytes pass through on their
+    way to the device. A pageable copy from a read-only shared mapping runs
+    at 1 to 4 GB/s on ROCm for Windows; a CPU copy into a pinned buffer and
+    an asynchronous copy from it run at about 10 GB/s on the Strix Halo
+    (2026-11-12). The driver stages a pageable copy through its own pinned
+    buffers too, so this adds no copy; it bounds the staging at 2 x 64 MiB."""
+
+    SIZE = 64 << 20
+
+    def __init__(self, torch):
+        self.torch = torch
+        self.buffers = [torch.empty(self.SIZE, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
+        self.events = [None, None]
+        self.turn = 0
+
+    def to_device(self, cpu, device):
+        torch = self.torch
+        dst = torch.empty(cpu.shape, dtype=cpu.dtype, device=device)
+        src, out = cpu.reshape(-1).view(torch.uint8), dst.view(-1).view(torch.uint8)
+        for at in range(0, src.numel(), self.SIZE):
+            n = min(self.SIZE, src.numel() - at)
+            b = self.turn
+            self.turn ^= 1
+            if self.events[b] is not None:
+                self.events[b].synchronize()
+            self.buffers[b][:n].copy_(src[at:at + n])
+            out[at:at + n].copy_(self.buffers[b][:n], non_blocking=True)
+            self.events[b] = torch.cuda.Event()
+            self.events[b].record()
+        return dst
+
+    def finish(self):
+        for e in self.events:
+            if e is not None:
+                e.synchronize()
+        self.events = [None, None]
 
 
 SAFETENSORS_DTYPES_ITEM = {name: item for name, item in SAFETENSORS_DTYPES.values()}
@@ -953,6 +1094,8 @@ class TorchRuntime:
         if not isinstance(fixes, list) or set(fixes) != KNOWN_FIXES or len(fixes) != len(KNOWN_FIXES):
             raise EngineFailure("config")
         add_site_packages(msg)
+        if "receiver" in msg:
+            load_receiver(msg["receiver"])
         if self.torch is not None:
             return self.torch
         stage("torch")
@@ -1033,7 +1176,7 @@ def _tokenizer_files(files, roles):
         entry = files[role]
         name = entry.get("name") if isinstance(entry, dict) else None
         if not isinstance(name, str) or name in named or os.path.basename(name) != name:
-            raise EngineFailure("files")
+            raise _file_failure(entry, "name")
         named[name] = entry_bytes(entry)
     return named
 
@@ -1338,6 +1481,101 @@ class HummingbirdXT:
             self.on_step, self.on_decode = None, None
 
 
+# ---- Scaled weights ---------------------------------------------------------
+# The compact FLUX.2 [klein] files store most linear weights scaled: Black
+# Forest Labs' FP8 transformer as float8_e4m3fn with a per-tensor
+# weight_scale (and an input_scale for FP8 activations, which a BF16 matmul
+# has no use for), and the mixed Qwen3 encoder in the compact set pinned in
+# set.go. The encoder uses float8_e4m3fn or NVFP4 layers named by a format
+# record. NVFP4 packs two E2M1 codes a byte, the first in the high nibble,
+# with one float8_e4m3fn scale per 16 values in cuBLAS's tiled layout and a
+# per-tensor float32 weight_scale_2. The engine computes in BF16, so each
+# scaled layer becomes a plain BF16 weight at load.
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+NVFP4_BLOCK = 16
+SCALED_FORMATS = ("float8_e4m3fn", "nvfp4")
+
+
+def from_blocked(torch, blocked, rows, cols):
+    """The (rows, cols) matrix of block scales stored in cuBLAS's tiled
+    layout: 128-row by 4-column tiles, each laid out as 32 by 16."""
+    row_tiles, col_tiles = -(-rows // 128), -(-cols // 4)
+    if blocked.numel() != row_tiles * 128 * col_tiles * 4:
+        raise EngineFailure("files")
+    t = blocked.reshape(-1, 32, 4, 4).transpose(1, 2)
+    t = t.reshape(row_tiles, col_tiles, 128, 4).permute(0, 2, 1, 3)
+    return t.reshape(row_tiles * 128, col_tiles * 4)[:rows, :cols]
+
+
+def nvfp4_to_bf16(torch, packed, block_scale, tensor_scale):
+    """One NVFP4 weight as BF16: E2M1 code times its block's scale times
+    the tensor's scale."""
+    if packed.dtype != torch.uint8 or packed.dim() != 2 or tensor_scale.numel() != 1:
+        raise EngineFailure("files")
+    rows, cols = packed.shape[0], packed.shape[1] * 2
+    if cols % NVFP4_BLOCK:
+        raise EngineFailure("files")
+    codes = torch.stack([packed >> 4, packed & 0x0F], dim=-1).reshape(rows, cols).int()
+    values = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)[codes]
+    blocks = cols // NVFP4_BLOCK
+    scale = from_blocked(torch, block_scale, rows, blocks).float() * tensor_scale.float().reshape(())
+    return (values.reshape(rows, blocks, NVFP4_BLOCK) * scale.unsqueeze(-1)).reshape(rows, cols).to(torch.bfloat16)
+
+
+def fp8_to_bf16(torch, weight, scale):
+    """One per-tensor scaled float8_e4m3fn weight as BF16."""
+    if scale.numel() != 1:
+        raise EngineFailure("files")
+    return (weight.float() * scale.float().reshape(())).to(torch.bfloat16)
+
+
+def _layer_format(torch, record):
+    """The format record is a uint8 tensor holding JSON."""
+    if record.dtype != torch.uint8 or record.dim() != 1:
+        raise EngineFailure("files")
+    try:
+        conf = json.loads(bytes(record.cpu().tolist()).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise EngineFailure("files") from None
+    if not isinstance(conf, dict) or conf.get("format") not in SCALED_FORMATS:
+        raise EngineFailure("files")
+    return conf["format"]
+
+
+def unscale_weights(torch, sd):
+    """sd with every scaled layer as a plain BF16 weight and its scale and
+    format entries removed. A file with no scaled layer is returned as it
+    is. A scale without its weight, a weight without its scale, or a format
+    other than float8_e4m3fn and nvfp4 fails the load."""
+    formats = {}
+    format_record_name = "comfy_quant"
+    for name in [n for n in sd if n.endswith("." + format_record_name)]:
+        formats[name.removesuffix(format_record_name)] = _layer_format(torch, sd.pop(name))
+    for name in [n for n in sd if n.endswith(".weight") and sd[n].dtype == torch.float8_e4m3fn]:
+        prefix = name[:-len("weight")]
+        if formats.get(prefix, "float8_e4m3fn") != "float8_e4m3fn":
+            raise EngineFailure("files")
+        formats[prefix] = "float8_e4m3fn"
+    for prefix, kind in formats.items():
+        weight, scale = sd.get(prefix + "weight"), sd.pop(prefix + "weight_scale", None)
+        sd.pop(prefix + "input_scale", None)
+        if weight is None or scale is None:
+            raise EngineFailure("files")
+        if kind == "nvfp4":
+            tensor_scale = sd.pop(prefix + "weight_scale_2", None)
+            if tensor_scale is None:
+                raise EngineFailure("files")
+            sd[prefix + "weight"] = nvfp4_to_bf16(torch, weight, scale, tensor_scale)
+        else:
+            if weight.dtype != torch.float8_e4m3fn:
+                raise EngineFailure("files")
+            sd[prefix + "weight"] = fp8_to_bf16(torch, weight, scale)
+        del weight
+    if any(n.endswith((".weight_scale", ".weight_scale_2", ".input_scale")) for n in sd):
+        raise EngineFailure("files")
+    return sd
+
+
 # ---- FLUX.2 [klein] --------------------------------------------------------
 # Configurations of black-forest-labs/FLUX.2-klein-4B @ e7b7dc27, held here
 # as constants so no configuration file is read: transformer/config.json
@@ -1377,8 +1615,8 @@ FLUX_TOKENIZER_ROLES = ("qwen3-tokenizer", "qwen3-tokenizer-config", "qwen3-toke
 
 class Flux2Klein:
     """Black Forest Labs' FLUX.2 [klein] 4B text to image, as the research
-    harness ran it (research/live-runs/2026-10-02.md), from Comfy-Org's single
-    files: the transformer through Diffusers' own FLUX.2 key conversion, the
+    harness ran it (research/live-runs/2026-10-02.md), from the single files
+    pinned by Flux2Klein4BTorch in set.go: the transformer through Diffusers' own FLUX.2 key conversion, the
     VAE through the provider's key table, and the Qwen3 encoder by name with
     its tied output head."""
 
@@ -1420,7 +1658,7 @@ class Flux2Klein:
         stage("flux-transformer")
         with empty_parameters(torch):
             tr = Flux2Transformer2DModel.from_config(dict(FLUX_TRANSFORMER))
-        sd = convert_flux2_transformer_checkpoint_to_diffusers(model_bytes(files["flux-transformer"], "cuda"))
+        sd = convert_flux2_transformer_checkpoint_to_diffusers(unscale_weights(torch, model_bytes(files["flux-transformer"], "cuda")))
         tr.load_state_dict(sd, assign=True, strict=True)
         del sd
         tr = tr.to(torch.bfloat16).eval()
@@ -1452,7 +1690,7 @@ class Flux2Klein:
         conf._attn_implementation = "sdpa"
         with empty_parameters(torch):
             te = Qwen3ForCausalLM(conf)
-        sd = model_bytes(files["qwen3"], "cuda")
+        sd = unscale_weights(torch, model_bytes(files["qwen3"], "cuda"))
         missing, unexpected = te.load_state_dict(sd, assign=True, strict=False)
         del sd
         if conf.tie_word_embeddings:
@@ -1532,6 +1770,115 @@ class Flux2Klein:
             self.on_decode = None
 
 
+class Flux2KleinCompact(Flux2Klein):
+    """FLUX.2 [klein] 4B from its compact files: Black Forest Labs' FP8
+    transformer and mixed FP8/NVFP4 Qwen3 4B encoder pinned by
+    Flux2Klein4BCompactTorch in set.go, each
+    turned to BF16 at load (unscale_weights), with the same VAE and
+    tokenizer."""
+
+    name = "flux2-klein-4b-compact"
+
+
+# Tongyi-MAI/Z-Image-Turbo's transformer/config.json, vae/config.json and
+# scheduler/scheduler_config.json; Diffusers' own default for each key they
+# leave out.
+ZIMAGE_TRANSFORMER = {"all_f_patch_size": [1], "all_patch_size": [2], "axes_dims": [32, 48, 48], "axes_lens": [1536, 512, 512],
+                      "cap_feat_dim": 2560, "dim": 3840, "in_channels": 16, "n_heads": 30, "n_kv_heads": 30, "n_layers": 30,
+                      "n_refiner_layers": 2, "norm_eps": 1e-05, "qk_norm": True, "rope_theta": 256.0, "t_scale": 1000.0}
+ZIMAGE_VAE = {"act_fn": "silu", "block_out_channels": [128, 256, 512, 512], "down_block_types": ["DownEncoderBlock2D"] * 4,
+              "force_upcast": True, "in_channels": 3, "latent_channels": 16, "latents_mean": None, "latents_std": None,
+              "layers_per_block": 2, "mid_block_add_attention": True, "norm_num_groups": 32, "out_channels": 3, "sample_size": 1024,
+              "scaling_factor": 0.3611, "shift_factor": 0.1159, "up_block_types": ["UpDecoderBlock2D"] * 4,
+              "use_post_quant_conv": False, "use_quant_conv": False}
+ZIMAGE_SCHEDULER = {"num_train_timesteps": 1000, "use_dynamic_shifting": False, "shift": 3.0}
+ZIMAGE_FILE_ROLES = ("zimage-transformer", "zimage-vae") + tuple(r for r in FLUX_FILE_ROLES if r not in ("flux-transformer", "flux-vae"))
+
+
+class ZImageTurbo(Flux2Klein):
+    """Tongyi-MAI's Z-Image-Turbo text to image from the single files pinned
+    by ZImageTurboTorch in set.go: the transformer through Diffusers' own Z-Image key conversion, the
+    FLUX.1 autoencoder through Diffusers' LDM key conversion, and the Qwen3
+    4B encoder and tokenizer FLUX.2 [klein] reads. It generates as FLUX.2
+    [klein] does, with no guidance."""
+
+    name = "z-image-turbo"
+
+    def load(self, msg, stage, runtime):
+        if msg.get("set") != self.name:
+            raise EngineFailure("config")
+        files, source, tables = msg.get("files"), msg.get("source"), msg.get("tables")
+        options, preset = msg.get("options"), msg.get("preset")
+        if not isinstance(files, dict) or sorted(files) != sorted(ZIMAGE_FILE_ROLES):
+            raise EngineFailure("files")
+        if source != {} or tables != {}:
+            raise EngineFailure("source")
+        if options != {} or not isinstance(preset, dict) or set(preset) != {"steps", "guidance"}:
+            raise EngineFailure("config")
+        steps, guidance = preset["steps"], preset["guidance"]
+        if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 50 or not isinstance(guidance, (int, float)):
+            raise EngineFailure("config")
+        tokenizer = _tokenizer_files(files, FLUX_TOKENIZER_ROLES)
+
+        torch = runtime.prepare(msg, stage)
+        self.torch = torch
+        from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, ZImagePipeline, ZImageTransformer2DModel
+        from diffusers.loaders.single_file_utils import (convert_ldm_vae_checkpoint,
+                                                         convert_z_image_transformer_checkpoint_to_diffusers)
+        from transformers import Qwen3Config, Qwen3ForCausalLM
+
+        stage("zimage-transformer")
+        with empty_parameters(torch):
+            tr = ZImageTransformer2DModel.from_config(dict(ZIMAGE_TRANSFORMER))
+        sd = convert_z_image_transformer_checkpoint_to_diffusers(model_bytes(files["zimage-transformer"], "cuda"))
+        tr.load_state_dict(sd, assign=True, strict=True)
+        del sd
+        tr = tr.to(torch.bfloat16).eval()
+
+        stage("zimage-vae")
+        with empty_parameters(torch):
+            vae = AutoencoderKL.from_config(dict(ZIMAGE_VAE))
+        sd = convert_ldm_vae_checkpoint(model_bytes(files["zimage-vae"], "cuda"), dict(ZIMAGE_VAE))
+        vae.load_state_dict(sd, assign=True, strict=True)
+        del sd
+        vae = vae.to(torch.bfloat16).eval()
+
+        stage("qwen3")
+        conf = Qwen3Config(**dict(QWEN3))
+        conf._attn_implementation = "sdpa"
+        with empty_parameters(torch):
+            te = Qwen3ForCausalLM(conf)
+        sd = model_bytes(files["qwen3"], "cuda")
+        missing, unexpected = te.load_state_dict(sd, assign=True, strict=False)
+        del sd
+        if conf.tie_word_embeddings:
+            te.tie_weights()
+            missing = [m for m in missing if m != "lm_head.weight"]
+        if missing or unexpected:
+            raise EngineFailure("files")
+        te = te.to(torch.bfloat16).eval()
+        te.forward = runtime.phased("text_encode", te.forward)
+
+        stage("pipeline")
+        tok = load_tokenizer(tokenizer)
+        sch = FlowMatchEulerDiscreteScheduler.from_config(dict(ZIMAGE_SCHEDULER))
+        pipe = ZImagePipeline(scheduler=sch, vae=vae, text_encoder=te, tokenizer=tok, transformer=tr)
+        decode = vae.decode
+
+        def decode_step(*a, **k):
+            if self.on_decode is not None:
+                self.on_decode(before=True)
+            out = decode(*a, **k)
+            if self.on_decode is not None:
+                self.on_decode(before=False)
+            return out
+
+        vae.decode = decode_step
+        self.pipe, self.steps, self.guidance = pipe, steps, float(guidance)
+        torch.cuda.synchronize()
+        log("loaded", set=self.name, gpu_reserved=torch.cuda.memory_reserved(), gpu_allocated=torch.cuda.memory_allocated())
+
+
 def _numel(shape):
     n = 1
     for d in shape:
@@ -1598,4 +1945,5 @@ def serve(sets, runtime=None):
 
 
 if __name__ == "__main__":
-    serve({HummingbirdXT.name: HummingbirdXT(), Flux2Klein.name: Flux2Klein()})
+    serve({HummingbirdXT.name: HummingbirdXT(), Flux2Klein.name: Flux2Klein(), Flux2KleinCompact.name: Flux2KleinCompact(),
+           ZImageTurbo.name: ZImageTurbo()})

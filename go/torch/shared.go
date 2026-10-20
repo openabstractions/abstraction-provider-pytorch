@@ -75,8 +75,10 @@ func newTorchShared(h *Host, engine TorchEngine) *torchShared {
 // busy reports whether name's holder component is in use: while any
 // engine operation holds the process every set is, and otherwise its own
 // queued or running work and, for the set whose lease the process is bound
-// to, the work of every set in the same process, since stopping it stops
-// them all.
+// to, the work of every other set loaded in the same process, since
+// stopping it stops them all. Work of a set not loaded in the process does
+// not hold the process's set: that set loads under its own lease, and an
+// idle set gives way to it (resource RES-L9).
 func (s *torchShared) busy(name string) bool {
 	if len(s.slot) > 0 {
 		return true
@@ -85,13 +87,13 @@ func (s *torchShared) busy(name string) bool {
 		return true
 	}
 	s.mu.Lock()
-	base := s.base
+	base, running := s.base, s.running
 	s.mu.Unlock()
 	if base != name {
 		return false
 	}
 	for other, f := range s.active {
-		if other != name && f != nil && f() {
+		if other != name && f != nil && f() && (running == nil || running.conn == nil || running.conn.holds(other)) {
 			return true
 		}
 	}
@@ -152,7 +154,9 @@ func (s *torchShared) ensure(ctx context.Context, name string) (*torchProcess, e
 			continue
 		}
 		if err != nil {
-			s.reportLoad(name)
+			if refused := s.reportLoad(name); refused != nil {
+				return nil, refused
+			}
 			return nil, h.mapFailure(name, amount, err)
 		}
 		s.mu.Lock()
@@ -477,26 +481,65 @@ func (l torchLoser) LoseAll(why string) []holder.Lost {
 }
 
 // reportLoad names, through the provider's error channel, the code the
-// engine last refused name's load with and the stage it reached; the
-// engine's own text stays in its log.
-func (s *torchShared) reportLoad(name string) {
+// engine last refused name's load with, the stage it reached, the model
+// file and check the refusal named, and the engine log's path; the
+// engine's own text stays in its log. A refusal that named one of the
+// set's model files is the caller's refusal too, engine:files:<role>:<check>,
+// and reportLoad returns it; otherwise nil.
+func (s *torchShared) reportLoad(name string) *Refusal {
 	s.mu.Lock()
 	running := s.last
 	s.mu.Unlock()
-	report := s.host.options.OnError
-	if running == nil || report == nil {
-		return
+	if running == nil {
+		return nil
 	}
 	state := running.conn.state(name)
 	if state == nil {
-		return
+		return nil
 	}
+	var code string
 	select {
-	case code := <-state.failed:
-		report(fmt.Errorf("pytorch: the PyTorch engine refused to load %s with code %s at stage %q; its log has the reason",
-			name, code, running.conn.stageOf(name)))
+	case code = <-state.failed:
 	default:
+		return nil
 	}
+	stage := running.conn.stageOf(name)
+	file, check := running.conn.failedFile(name)
+	role := ""
+	if sp, ok := s.engine.place(name); ok && file != "" {
+		for _, f := range sp.Set.Files {
+			if f.Name == file {
+				role = f.Role
+			}
+		}
+	}
+	engineLog := s.engine.Log
+	if engineLog == "" {
+		engineLog = "the engine's stderr"
+	}
+	var detail string
+	switch {
+	case check != "" && role != "":
+		detail = fmt.Sprintf("the PyTorch engine refused to load %s with code %s at stage %q: model file %s (%s) failed its %s check; the engine log is %s",
+			name, code, stage, file, role, check, engineLog)
+	case check != "":
+		detail = fmt.Sprintf("the PyTorch engine refused to load %s with code %s at stage %q: a model file failed its %s check; the engine log is %s",
+			name, code, stage, check, engineLog)
+	default:
+		detail = fmt.Sprintf("the PyTorch engine refused to load %s with code %s at stage %q; the engine log %s has the reason",
+			name, code, stage, engineLog)
+	}
+	if report := s.host.options.OnError; report != nil {
+		report(errors.New("pytorch: " + detail))
+	}
+	if check == "" {
+		return nil
+	}
+	word := "engine:files:" + check
+	if role != "" {
+		word = "engine:files:" + role + ":" + check
+	}
+	return &Refusal{Word: word, Detail: detail}
 }
 
 // reportPeak reports, through the provider's error channel, a job whose

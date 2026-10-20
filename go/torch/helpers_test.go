@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	inference "github.com/openabstractions/abstraction-inference/go"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
 	res "github.com/openabstractions/abstraction-resource/go/client"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 )
@@ -122,7 +122,7 @@ type openACL struct{}
 
 func (openACL) Restrict([]string) error { return nil }
 
-func (openACL) Check(string, *enginefiles.Handle) error { return nil }
+func (openACL) Check(string, *programfiles.Handle) error { return nil }
 
 // fakeLeases is the lease service as this provider sees it: it grants, it
 // records renewals and releases, and it can put one yield request to the
@@ -202,6 +202,10 @@ func (f *fakeLeases) Renew(lease string) (res.LeaseChange, error) {
 	defer f.mu.Unlock()
 	f.renews++
 	return res.LeaseChange{Applied: f.live[lease]}, nil
+}
+
+func (*fakeLeases) Label(string, string) (res.LeaseChange, error) {
+	return res.LeaseChange{Applied: true}, nil
 }
 
 func (f *fakeLeases) Release(lease string) (res.LeaseChange, error) {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/openabstractions/abstraction-facade/go/supervision"
 	"image"
 	"image/color"
 	"image/png"
@@ -25,10 +26,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openabstractions/abstraction-facade/go/programfiles"
 	wire "github.com/openabstractions/abstraction-inference/go/abstraction/inference/api"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginefiles"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/enginelaunch"
-	"github.com/openabstractions/abstraction-inference/go/providerhost/sdcpp"
+	"github.com/openabstractions/abstraction-provider-kit/go/enginelaunch"
+	"github.com/openabstractions/abstraction-provider-kit/go/sdcpp"
+	"github.com/openabstractions/abstraction-provider-pytorch/go/internal/personfolders"
 	"github.com/openabstractions/abstraction-resource/go/gpufault"
 	storage "github.com/openabstractions/abstraction-storage/go"
 )
@@ -70,7 +72,17 @@ var torchVenv = sync.OnceValues(func() (string, error) {
 
 var torchVenvDir string
 
+// TestMain runs the tests with the person's per-user folders inside a
+// temporary folder (personfolders.Enter), removed after the test component.
 func TestMain(m *testing.M) {
+	if plantedInterpreter() {
+		os.Exit(0)
+	}
+	person, err := personfolders.Enter()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	code := m.Run()
 	if torchVenvDir != "" {
 		//unchecked: a temporary venv a later run does not read
@@ -82,6 +94,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "FAIL: the test component: %v\n", err)
 		code = 1
 	}
+	personfolders.Leave(person)
 	os.Exit(code)
 }
 
@@ -122,16 +135,16 @@ func testTorchRuntime(t *testing.T, python string) torchRuntime {
 			home = strings.TrimSpace(value)
 		}
 	}
-	pin := func(p string) enginefiles.File {
+	pin := func(p string) programfiles.File {
 		data, err := os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
 		}
 		sum := sha256.Sum256(data)
-		return enginefiles.File{Path: filepath.Base(p), Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
+		return programfiles.File{Path: filepath.Base(p), Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
 	}
 	// The base interpreter's files that run, as the reviewed pin names them.
-	var base []enginefiles.File
+	var base []programfiles.File
 	for _, pattern := range []string{"python.exe", "python3*.dll", "vcruntime140*.dll", "python3", "DLLs/_socket.pyd", "DLLs/select.pyd"} {
 		matches, _ := filepath.Glob(filepath.Join(home, filepath.FromSlash(pattern)))
 		for _, m := range matches {
@@ -247,7 +260,7 @@ func newTorchFixture(t *testing.T, args ...string) *torchFixture {
 	record := filepath.Join(root, "record.jsonl")
 	return &torchFixture{dir: root, store: store, record: record, downloads: modelRoot, engine: TorchEngine{
 		Python: python, Source: source, Set: set, Places: TorchModelPlaces(state, set), ModelRecord: TorchModelRecord(state, set),
-		State: filepath.Join(state, "torch"), Files: enginefiles.NewVerifier(enginefiles.Options{ACL: openACL{}}),
+		State: filepath.Join(state, "torch"), Files: programfiles.NewVerifier(programfiles.Options{ACL: openACL{}}),
 		Ready: 30 * time.Second, Log: filepath.Join(state, "logs", "torch.log"), Sandbox: manifest,
 		runtime: testTorchRuntime(t, python), script: fake,
 		fixture: append([]string{"--real=" + realScript, "--record=" + record}, args...),
@@ -812,6 +825,38 @@ func TestTorchEngineLoadFailuresGiveTheLeaseBack(t *testing.T) {
 	}
 }
 
+// PYTORCH-T5: a load the engine refuses over one model file names that
+// file, its role and the check it failed in the provider's log line, with
+// the engine log's path, and in the call's reason.
+func TestTorchEngineLoadRefusalNamesTheFile(t *testing.T) {
+	engineRuns(t)
+	f := newTorchFixture(t, "--mode=unpinned-file")
+	var mu sync.Mutex
+	var reported []string
+	h := f.host(t, newFakeLeases(), func(o *Options) {
+		o.OnError = func(err error) { mu.Lock(); reported = append(reported, err.Error()); mu.Unlock() }
+	})
+	o := awaitVideo(t, h, startVideo(t, h, f.request(t, "job-1")), wire.VideoStateFailed, wire.VideoStateCompleted)
+	roles := make([]string, 0, len(f.engine.Set.Files))
+	byRole := map[string]string{}
+	for _, file := range f.engine.Set.Files {
+		roles = append(roles, file.Role)
+		byRole[file.Role] = file.Name
+	}
+	slices.Sort(roles)
+	first := roles[0]
+	if want := "engine:files:" + first + ":pin"; o.Status != wire.VideoStateFailed || o.Reason != want {
+		t.Fatalf("observed %+v, want the reason %s; log %s", o, want, f.log())
+	}
+	mu.Lock()
+	said := strings.Join(reported, "\n")
+	mu.Unlock()
+	want := fmt.Sprintf("model file %s (%s) failed its pin check; the engine log is %s", byRole[first], first, f.engine.Log)
+	if !strings.Contains(said, want) {
+		t.Fatalf("the provider's log line %q does not say %q", said, want)
+	}
+}
+
 // PYTORCH-T2: a source file that is not the pin is refused before any
 // lease.
 func TestTorchSourceIsProvedBeforeTheLease(t *testing.T) {
@@ -907,7 +952,7 @@ func TestTorchGPUPathGateRunsBeforeTheLease(t *testing.T) {
 	for _, lib := range []string{"hipblaslt", "rocblas"} {
 		dir := filepath.Join(libs, lib, "library", "gfx-test")
 		write(t, filepath.Join(dir, "TensileLibrary_"+strings.Repeat("x", 200)+".dat"), []byte("k"))
-		if enginelaunch.UTF16Len(dir)+220 <= enginelaunch.MaxLibraryPath {
+		if supervision.UTF16Len(dir)+220 <= supervision.MaxLibraryPath {
 			t.Skip("the temporary folder is too short for a kernel path over MAX_PATH")
 		}
 	}
@@ -945,7 +990,7 @@ func TestTorchBaseInterpreterIsProved(t *testing.T) {
 	if len(f.engine.runtime.Base) == 0 {
 		t.Skip("the test venv's base interpreter has no regular file to pin")
 	}
-	f.engine.runtime.Base = append([]enginefiles.File(nil), f.engine.runtime.Base...)
+	f.engine.runtime.Base = append([]programfiles.File(nil), f.engine.runtime.Base...)
 	f.engine.runtime.Base[0].SHA256 = strings.Repeat("0", 64)
 	leases := newFakeLeases()
 	h := f.host(t, leases, nil)
@@ -978,7 +1023,7 @@ func TestHummingbirdTorchRowIsValid(t *testing.T) {
 	// loads (_socket, and select through selectors) are pinned with the
 	// base interpreter.
 	for _, name := range []string{"DLLs/_socket.pyd", "DLLs/select.pyd"} {
-		if !slices.ContainsFunc(reviewedTorchRuntime.Base, func(f enginefiles.File) bool { return f.Path == name }) {
+		if !slices.ContainsFunc(reviewedTorchRuntime.Base, func(f programfiles.File) bool { return f.Path == name }) {
 			t.Fatalf("the reviewed runtime does not pin %s: %+v", name, reviewedTorchRuntime.Base)
 		}
 	}

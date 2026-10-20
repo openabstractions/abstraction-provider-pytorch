@@ -45,7 +45,6 @@ func TestRemoveWithoutManifestLeavesUnownedEngineTree(t *testing.T) {
 }
 
 func TestWheelRefusesJunctionedScriptsBeforeExtraction(t *testing.T) {
-	requireComponentSecurityProbeOptIn(t)
 	dir := t.TempDir()
 	venv := filepath.Join(dir, "venv")
 	outside := filepath.Join(dir, "outside")
@@ -94,7 +93,6 @@ func TestHostCloseReleasesSandboxBeforeSetup(t *testing.T) {
 }
 
 func TestCopiedManifestCannotAdoptAnotherComponentProfile(t *testing.T) {
-	requireComponentSecurityProbeOptIn(t)
 	owner, err := torchComponent()
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +143,6 @@ func TestCopiedManifestCannotAdoptAnotherComponentProfile(t *testing.T) {
 }
 
 func TestInstallRefusesJunctionedEngineBeforeEffects(t *testing.T) {
-	requireComponentSecurityProbeOptIn(t)
 	root := filepath.Join(t.TempDir(), "component")
 	outside := filepath.Join(t.TempDir(), "outside")
 	if err := os.MkdirAll(root, 0o700); err != nil {
